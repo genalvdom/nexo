@@ -1,0 +1,134 @@
+---
+type: Configuration Reference
+title: Configuration reference
+description: Every environment variable Nexo reads, with defaults and effects.
+resource: ../../src/nexo/config.py
+tags: [operations, configuration]
+status: draft
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-19T20:14:37Z }
+sources:
+  - id: config
+    resource: ../../src/nexo/config.py
+    title: Settings
+  - id: env
+    resource: ../../.env.example
+    title: Environment template
+---
+
+Settings load from the environment or `.env` (names are case-insensitive). A test fails if a setting
+is missing from this page.[^config] Template: `.env.example`.[^env]
+
+# Schema
+
+**vLLM**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `VLLM_BASE_URL` | `http://vllm-inference-service:8000/v1` | OpenAI-compatible endpoint for extraction, routing and the agent. |
+| `VLLM_API_KEY` | `EMPTY` | Must match vLLM's `--api-key`. Secret. |
+| `VLLM_MODEL` | `meta-llama/Llama-3.3-70B-Instruct` | Served model name. |
+| `LLM_TIMEOUT_S` | `120` | Per-request timeout. |
+| `LLM_MAX_RETRIES` | `3` | Client retries on connection errors, 408/409/429 and 5xx. |
+| `AGENT_TEMPERATURE` | `0.1` | Agent sampling temperature. |
+| `AGENT_MAX_TOKENS` | `2048` | Max output tokens per agent model call. |
+
+**Embeddings**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `EMBEDDING_PROVIDER` | `openai_compatible` | `fake` gives deterministic offline vectors (tests, dev). |
+| `EMBEDDING_BASE_URL` | `http://vllm-embedding-service:8000/v1` | Separate pooling server. |
+| `EMBEDDING_API_KEY` | `EMPTY` | Secret. |
+| `EMBEDDING_MODEL` | `BAAI/bge-m3` | Embedding model. |
+| `EMBEDDING_DIMENSIONS` | `1024` | Used by the fake provider. |
+
+**Neo4j**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `NEO4J_URI` | `neo4j://neo4j:7687` | Bolt/neo4j URI. |
+| `NEO4J_DATABASE` | `neo4j` | Database name. |
+| `NEO4J_USER` / `NEO4J_PASSWORD` | `neo4j` / empty | Writer account (ingestion). Secret. |
+| `NEO4J_READ_USER` / `NEO4J_READ_PASSWORD` | unset | Reader-role account for the agent tool; falls back to the writer account. |
+| `NEO4J_QUERY_TIMEOUT_S` | `15` | Per agent query. |
+| `NEO4J_MAX_ROWS` | `50` | Row cap per agent query (1–1000). |
+
+**Storage and ingestion**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `VECTOR_STORE_PATH` | `.data/vector_store.json` | Local chunk store file. |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1200` / `150` | Characters per chunk and overlap inside a section. |
+| `EXTRACTION_ATTEMPTS` | `3` | Validation retries per chunk. |
+| `EXTRACTION_CONCURRENCY` | `8` | Parallel extraction calls. |
+| `REQUIRE_GROUNDED_EVIDENCE` | `true` | Drop triples whose evidence quote is not in the chunk. |
+| `EXTRACTION_CONTEXT_CHARS` | `500` | Tail of the previous chunk shown to the extractor (context only); 0 disables. |
+| `ONTOLOGY_PATH` | unset | [Relation ontology](../components/relation-ontology.md) JSON; unset keeps free-form predicates. |
+| `GLOSSARY_PATH` | unset | JSON object of acronym → expansion. |
+
+**Entity resolution**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ENTITY_RESOLUTION` | `llm` | `off`, `deterministic` or `llm` ([entity resolution](../components/entity-resolution.md)). |
+| `RESOLUTION_MAX_CANDIDATES` | `25` | Candidates offered to the model per mention. |
+| `RESOLUTION_BATCH_SIZE` | `30` | Mentions per model call. |
+
+**Sensitive data**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SENSITIVE_DATA_PROVIDER` | `regex` | `none`, `regex` or `comprehend_medical`. |
+| `SENSITIVE_DATA_POLICY` | `tag` | `tag` or `redact`. |
+| `AWS_REGION` | unset | Required for `comprehend_medical`. |
+| `DEFAULT_CLEARANCE` | `internal` | Clearance when the caller does not pass one. |
+
+**Investigator agent**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AGENT_MAX_TURNS` | `12` | Strands loop turns. |
+| `AGENT_MAX_TOTAL_TOKENS` | `120000` | Cumulative token cap. |
+| `AGENT_MAX_TOOL_CALLS` | `16` | Tool calls per investigation. |
+| `AGENT_TIMEOUT_S` | `300` | Wall-clock cap. |
+| `AGENT_MAX_CHUNKS_PER_CALL` | `10` | Chunks per `fetch_vector_chunks` call. |
+| `SEED_CHUNKS` | `5` | Vector seeds for `vector`/`hybrid` strategies (0 disables). |
+| `TOOL_RESULT_MAX_CHARS` | `12000` | Max serialized tool output. |
+
+**Orchestration**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MAX_QUERY_CHARS` | `2000` | Router's deterministic length gate. |
+| `CHECKPOINT_BACKEND` | `sqlite` | `memory` (tests only), `sqlite` (single node) or `postgres`. |
+| `CHECKPOINT_SQLITE_PATH` | `.data/checkpoints.sqlite` | SQLite file. |
+| `CHECKPOINT_POSTGRES_URI` | unset | Required for `postgres` (extra `postgres`). Secret. |
+
+**Evaluation**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `JUDGE_BASE_URL` | unset (falls back to `VLLM_BASE_URL`) | Judge endpoint. |
+| `JUDGE_MODEL` | unset | Enables LLM-as-a-judge in `nexo eval`. |
+
+**Observability**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OTEL_SERVICE_NAME` | `nexo` | `service.name` resource attribute. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP base URL; unset disables export. |
+| `OTEL_CONSOLE_EXPORT` | `false` | Print spans to stdout. |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | `no_content` | `span_only` / `span_and_event` put prompts, outputs and agent Cypher on spans (may carry PII). Standard GenAI variable. |
+| `OTEL_SEMCONV_STABILITY_OPT_IN` | derived | Strands conventions and redaction; derived from content capture unless set. |
+| `OTEL_INSTRUMENT_OPENAI` | `true` | Official GenAI instrumentation of the openai SDK (one `chat {model}` span per vLLM call). |
+| `DEPLOYMENT_ENVIRONMENT` | `dev` | `deployment.environment.name` attribute. |
+
+**Logging**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | Root log level. |
+| `LOG_FORMAT` | `text` | `text` or `json` (one object per line, with `trace_id`, `span_id` and `result`). |
+
+[^config]: Settings
+[^env]: Environment template
