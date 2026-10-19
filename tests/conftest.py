@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -14,11 +18,14 @@ from nexo.llm import build_embeddings
 from nexo.storage.graph_store import ReadResult
 from nexo.storage.schemas import ChunkRecord, Sensitivity
 from nexo.storage.vector_store import LocalChunkStore
+from nexo.telemetry import instrument_openai
 
 _EXPORTER = InMemorySpanExporter()
 _provider = TracerProvider()
 _provider.add_span_processor(SimpleSpanProcessor(_EXPORTER))
 trace.set_tracer_provider(_provider)
+os.environ.pop("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", None)
+instrument_openai(_provider)
 
 
 @pytest.fixture
@@ -74,3 +81,19 @@ class FakeGraph:
         if self.error:
             raise self.error
         return ReadResult(rows=self.rows, truncated=False)
+
+
+class RecordingChatModel(BaseChatModel):
+    """Scripted chat model that records every prompt it receives."""
+
+    replies: list[str]
+    prompts: list[list[Any]] = []
+
+    @property
+    def _llm_type(self) -> str:
+        return "recording-fake"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        self.prompts.append(list(messages))
+        reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=reply))])

@@ -22,17 +22,33 @@ from pydantic import BaseModel, Field
 
 from nexo.agents.models import AgentOutput
 from nexo.llm import invoke_structured
-from nexo.storage.schemas import Triple
+from nexo.storage.ontology import Ontology
+from nexo.storage.schemas import GroundedTriple, Triple
 
 
 def _ratio(numerator: int, denominator: int) -> float | None:
     return round(numerator / denominator, 4) if denominator else None
 
 
-def extraction_scores(predicted: Sequence[Triple], gold: Sequence[Triple]) -> dict[str, float | None]:
-    key = lambda t: (t.head.key, t.relation, t.tail.key)  # noqa: E731
-    gold_keys = {key(t) for t in gold}
-    pred_keys = {key(t) for t in predicted}
+TripleKey = tuple[str, str, str]
+
+
+def triple_key(triple: Triple, ontology: Ontology | None = None) -> TripleKey:
+    """(head key, relation, tail key), mapped onto the ontology when one is given."""
+    if ontology is None:
+        return triple.head.key, triple.relation, triple.tail.key
+    mapping = ontology.map(triple.relation, triple.head.type, triple.tail.type)
+    head, tail = (triple.tail, triple.head) if mapping.swap else (triple.head, triple.tail)
+    return head.key, mapping.relation, tail.key
+
+
+def grounded_key(triple: GroundedTriple) -> TripleKey:
+    return triple.head.key, triple.relation, triple.tail.key
+
+
+def extraction_scores(predicted: Iterable[TripleKey], gold: Iterable[TripleKey]) -> dict[str, float | None]:
+    gold_keys = set(gold)
+    pred_keys = set(predicted)
     true_positive = len(gold_keys & pred_keys)
     # A false value: right head + predicate, wrong tail (e.g. wrong dosage/date entity).
     gold_slots = {(h, r) for h, r, _ in gold_keys}

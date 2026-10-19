@@ -137,9 +137,32 @@ def normalize_relation(value: str) -> str:
     return normalized
 
 
+_LEGAL_SUFFIXES = {"inc", "incorporated", "corp", "corporation", "co", "company", "llc", "ltd", "limited",
+                   "plc", "gmbh", "ag", "sa", "srl", "sas", "nv", "bv", "lp", "llp"}
+_HONORIFICS = {"mr", "mrs", "ms", "miss", "dr", "prof", "sir", "dame", "sr", "sra", "srta", "lic", "ing"}
+
+
+def normalize_name(name: str, entity_type: EntityType) -> str:
+    """Surface form -> comparison form: 'The Acme Holdings, Inc.' -> 'acme holdings'.
+
+    Only type-safe rules: legal suffixes for organizations, honorifics for
+    people. Medication/condition names keep every token (dose, variant).
+    """
+    tokens = re.sub(r"[^\w\s&-]", " ", name.casefold()).split()
+    if tokens and tokens[0] == "the" and len(tokens) > 1:
+        tokens = tokens[1:]
+    if entity_type is EntityType.ORGANIZATION:
+        while len(tokens) > 1 and tokens[-1] in _LEGAL_SUFFIXES:
+            tokens = tokens[:-1]
+    if entity_type is EntityType.PERSON:
+        while len(tokens) > 1 and tokens[0] in _HONORIFICS:
+            tokens = tokens[1:]
+    return " ".join(tokens)
+
+
 def entity_key(name: str, entity_type: EntityType) -> str:
-    """Merge key for entity resolution: type + case/whitespace-folded name."""
-    return f"{entity_type.value}:{' '.join(name.casefold().split())}"
+    """Exact-match key: type + normalized name. Fuzzier merges happen in resolution."""
+    return f"{entity_type.value}:{normalize_name(name, entity_type)}"
 
 
 class EntityRef(BaseModel):
@@ -148,6 +171,10 @@ class EntityRef(BaseModel):
     name: ShortText = Field(description="Canonical full name as written in the text, pronouns resolved")
     type: EntityType
     description: str = Field(default="", max_length=300, description="Short description grounded in the text")
+    aliases: list[ShortText] = Field(
+        default_factory=list, max_length=10,
+        description="Other names the passage uses for this same entity (acronyms, short or former names)",
+    )
     proposed_codes: dict[CodeSystem, str] = Field(
         default_factory=dict,
         description="Terminology codes if the text states them. Unverified until checked by a terminology service.",
@@ -185,10 +212,30 @@ class ExtractionResult(BaseModel):
     triples: list[Triple] = Field(default_factory=list, max_length=100)
 
 
+class Resolution(StrEnum):
+    EXACT = "exact"  # same normalized key
+    ALIAS = "alias"  # a stated alias or surface form matched
+    LLM = "llm"  # the resolution model matched it to an existing entity
+    NEW = "new"
+
+
+class ResolvedEntity(BaseModel):
+    """Where one extracted mention landed in the graph."""
+
+    key: str  # canonical entity key the mention is merged into
+    surface: str  # the name as written in the chunk
+    method: Resolution = Resolution.NEW
+    ref: EntityRef | None = None  # the extracted mention (type, description, aliases, codes)
+
+
 class GroundedTriple(BaseModel):
-    """A triple bound to the chunk it was extracted from - the graph/vector link."""
+    """A triple bound to its chunk, mapped onto the ontology and resolved entities."""
 
     triple: Triple
     chunk_id: str
     source_id: str
     sensitivity: Sensitivity
+    relation: str  # canonical relation actually written
+    original_relation: str | None = None  # extracted predicate, when the ontology rewrote it
+    head: ResolvedEntity  # graph head (already swapped for inverse relations)
+    tail: ResolvedEntity

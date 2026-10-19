@@ -26,9 +26,13 @@ from nexo.orchestration.graph import GraphDependencies, build_graph
 from nexo.orchestration.state import ReviewDecision
 from nexo.storage.graph_store import GraphStore
 from nexo.storage.ingest import KnowledgeGraphIngestor
+from nexo.storage.ontology import Ontology
+from nexo.storage.resolution import EntityResolver
 from nexo.storage.sensitive_data import build_detector
 from nexo.storage.vector_store import LocalChunkStore
-from nexo.telemetry import OTelCallbackHandler, setup_telemetry, traced_span
+from nexo.telemetry import setup_telemetry, traced_span
+
+WORKFLOW_NAME = "nexo-investigation"
 
 
 class RunResult(BaseModel):
@@ -88,11 +92,14 @@ class Runtime:
 
     def _config(self, thread_id: str) -> dict[str, Any]:
         return {"configurable": {"thread_id": thread_id}, "callbacks": self.callbacks,
-                "run_name": "nexo-investigation", "metadata": {"thread_id": thread_id}}
+                "run_name": WORKFLOW_NAME, "metadata": {"thread_id": thread_id}}
 
     def _drive(self, payload: Any, thread_id: str, operation: str) -> RunResult:
-        attributes = {"nexo.operation": operation, "langgraph.thread_id": thread_id}
-        with traced_span("nexo.request", attributes) as span:
+        # GenAI workflow span (OTel GenAI conventions): one per graph run; the
+        # LangGraph thread id is the conversation id that ties start and review.
+        attributes = {"gen_ai.operation.name": "invoke_workflow", "gen_ai.workflow.name": WORKFLOW_NAME,
+                      "gen_ai.conversation.id": thread_id, "nexo.operation": operation}
+        with traced_span(f"invoke_workflow {WORKFLOW_NAME}", attributes) as span:
             for update in self.graph.stream(payload, self._config(thread_id), stream_mode="updates"):
                 for node, delta in update.items():
                     if node == "__interrupt__":
@@ -145,29 +152,31 @@ def open_runtime(settings: Settings) -> Iterator[Runtime]:
             detector=build_detector(settings.sensitive_data_provider, aws_region=settings.aws_region),
             router_llm=build_chat_model(settings, temperature=0.0),
         )
-        yield Runtime(
-            graph=build_graph(deps, checkpointer),
-            settings=settings,
-            callbacks=[OTelCallbackHandler(capture_content=settings.otel_capture_content)],
-        )
+        yield Runtime(graph=build_graph(deps, checkpointer), settings=settings)
 
 
 @contextmanager
-def open_ingestor(settings: Settings) -> Iterator[KnowledgeGraphIngestor]:
+def open_ingestor(settings: Settings, *, writes: bool = True) -> Iterator[KnowledgeGraphIngestor]:
     setup_telemetry(settings)
     graph_store = GraphStore.from_settings(settings, read_only=False)
     try:
         graph_store.verify()
-        graph_store.ensure_schema()
+        if writes:
+            graph_store.ensure_schema()
         glossary = json.loads(settings.glossary_path.read_text()) if settings.glossary_path else {}
+        llm = build_chat_model(settings, temperature=0.0)
         yield KnowledgeGraphIngestor(
-            llm=build_chat_model(settings, temperature=0.0),
+            llm=llm,
             chunk_store=LocalChunkStore(build_embeddings(settings), settings.vector_store_path),
             graph_writer=graph_store,
             detector=build_detector(settings.sensitive_data_provider, aws_region=settings.aws_region),
             settings=settings,
             glossary=glossary,
-            callbacks=[OTelCallbackHandler(capture_content=settings.otel_capture_content)],
+            ontology=Ontology.load(settings.ontology_path) if settings.ontology_path else None,
+            resolver=EntityResolver(
+                catalog=graph_store, llm=llm, mode=settings.entity_resolution,
+                max_candidates=settings.resolution_max_candidates, batch_size=settings.resolution_batch_size,
+            ),
         )
     finally:
         graph_store.close()

@@ -8,15 +8,27 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 
 import pytest
 from neo4j import GraphDatabase
 from neo4j.exceptions import ClientError
+from opentelemetry.trace import SpanKind
 
 from nexo.agents.models import InvestigationScope
 from nexo.agents.tools import InvestigationContext, build_investigation_tools
 from nexo.storage.graph_store import GraphStore
-from nexo.storage.schemas import EntityRef, GroundedTriple, Sensitivity, Triple
+from nexo.storage.schemas import (
+    ChunkRecord,
+    DocumentMetadata,
+    EntityRef,
+    EntityType,
+    GroundedTriple,
+    Resolution,
+    ResolvedEntity,
+    Sensitivity,
+    Triple,
+)
 from nexo.storage.vector_store import ChunkFilter
 
 URI = os.environ.get("NEO4J_TEST_URI")
@@ -25,48 +37,150 @@ pytestmark = pytest.mark.skipif(not URI, reason="NEO4J_TEST_URI not set")
 C1, C2, C3 = ("chk_" + c * 16 for c in "123")
 
 
-def _triple(head, rel, tail, evidence, head_type="Organization", tail_type="Organization"):
-    return Triple(head=EntityRef(name=head, type=head_type), relation=rel,
-                  tail=EntityRef(name=tail, type=tail_type), evidence=evidence)
+def _resolved(name, type_="Organization", key=None, method=Resolution.NEW, aliases=()):
+    ref = EntityRef(name=name, type=type_, aliases=list(aliases))
+    return ResolvedEntity(key=key or ref.key, surface=name, method=method, ref=ref)
+
+
+def _row(chunk_id, source_id, head, rel, tail, sensitivity=Sensitivity.INTERNAL, original=None):
+    triple = Triple(head=head.ref, relation=rel, tail=tail.ref, evidence=f"{head.surface} {rel} {tail.surface}")
+    return GroundedTriple(triple=triple, chunk_id=chunk_id, source_id=source_id, sensitivity=sensitivity,
+                          relation=triple.relation, original_relation=original, head=head, tail=tail)
+
+
+def _chunks(source_id, *chunk_ids, sensitivity=Sensitivity.INTERNAL):
+    return [ChunkRecord(chunk_id=c, source_id=source_id, ordinal=i, text=f"text {i}", sensitivity=sensitivity,
+                        ingested_at=datetime.now(UTC)) for i, c in enumerate(chunk_ids)]
 
 
 @pytest.fixture
 def store():
     driver = GraphDatabase.driver(URI, auth=("neo4j", os.environ["NEO4J_TEST_PASSWORD"]))
     driver.execute_query("MATCH (n) DETACH DELETE n")
-    graph = GraphStore(driver, database="neo4j", query_timeout_s=10, max_rows=50)
+    graph = GraphStore(driver, database="neo4j", query_timeout_s=10, max_rows=50, uri=URI)
     graph.ensure_schema()
     yield graph
     graph.close()
 
 
 def test_replace_source_merges_provenance_and_cleans_up(store):
-    doc_a = [GroundedTriple(triple=_triple("Acme", "acquired", "Beta Labs", "Acme acquired Beta Labs"),
-                            chunk_id=C1, source_id="a", sensitivity=Sensitivity.INTERNAL),
-             GroundedTriple(triple=_triple("Beta Labs", "treats", "Jane Roe", "Beta Labs treats Jane Roe",
-                                           tail_type="Person"),
-                            chunk_id=C2, source_id="a", sensitivity=Sensitivity.PHI)]
-    doc_b = [GroundedTriple(triple=_triple("acme", "ACQUIRED", "beta labs", "acme acquired beta labs"),
-                            chunk_id=C3, source_id="b", sensitivity=Sensitivity.INTERNAL)]
-    assert store.replace_source("a", doc_a) == 2
-    store.replace_source("b", doc_b)
+    acme, beta = _resolved("Acme"), _resolved("Beta Labs")
+    doc_a = [_row(C1, "a", acme, "ACQUIRED", beta),
+             _row(C2, "a", beta, "TREATS", _resolved("Jane Roe", "Person"), Sensitivity.PHI)]
+    doc_b = [_row(C3, "b", _resolved("acme"), "ACQUIRED", _resolved("beta labs"))]
+    assert store.replace_source(DocumentMetadata(source_id="a"), _chunks("a", C1, C2), doc_a) == 2
+    store.replace_source(DocumentMetadata(source_id="b"), _chunks("b", C3), doc_b)
 
-    acme = store.run_read_query(
+    acme_row = store.run_read_query(
         "MATCH (e:Entity:Organization {key: 'Organization:acme'}) RETURN e.chunk_id AS first, e.chunk_ids AS ids"
     ).rows
-    assert acme == [{"first": C1, "ids": [C1, C3]}]  # resolved across documents, provenance merged
+    assert acme_row == [{"first": C1, "ids": [C1, C3]}]  # same key across documents, provenance merged
     edge = store.run_read_query("MATCH (:Entity)-[r:ACQUIRED]->(:Entity) RETURN r.chunk_ids AS ids").rows
     assert edge == [{"ids": [C1, C3]}]
     labels = store.run_read_query("MATCH (e:Entity {name: 'Jane Roe'}) RETURN labels(e) AS l").rows[0]["l"]
     assert {"Entity", "Person", "PII", "PHI"} <= set(labels)
     hops = store.run_read_query(
-        "MATCH p = (a:Entity {name: 'Acme'})-[*..2]->(b:Entity {name: 'Jane Roe'}) RETURN length(p) AS n").rows
+        "MATCH p = (a:Entity {name: 'Acme'})-[:ACQUIRED|TREATS*..2]->(b:Entity {name: 'Jane Roe'}) "
+        "RETURN length(p) AS n").rows
     assert hops == [{"n": 2}]
 
-    store.replace_source("a", [])  # document a withdrawn
+    store.replace_source(DocumentMetadata(source_id="a"), [], [])  # document a withdrawn
     remaining = store.run_read_query("MATCH (e:Entity) RETURN e.name AS name, e.chunk_id AS first ORDER BY name").rows
     assert remaining == [{"name": "Acme", "first": C3}, {"name": "Beta Labs", "first": C3}]
     assert store.run_read_query("MATCH (c:Chunk) RETURN collect(c.chunk_id) AS ids").rows == [{"ids": [C3]}]
+    assert store.run_read_query("MATCH (d:Document) RETURN collect(d.source_id) AS ids").rows == [{"ids": ["b"]}]
+
+
+def test_lexical_graph_orders_chunks_and_links_document(store):
+    store.replace_source(DocumentMetadata(source_id="a", title="Memo", doc_type="memo"),
+                         _chunks("a", C1, C2, C3), [])
+    path = store.run_read_query(
+        "MATCH (d:Document {source_id: 'a'})-[:FIRST_CHUNK]->(first:Chunk) "
+        "MATCH p = (first)-[:NEXT_CHUNK*0..]->(last:Chunk) WHERE NOT (last)-[:NEXT_CHUNK]->() "
+        "RETURN [c IN nodes(p) | c.chunk_id] AS order, d.title AS title").rows
+    assert path == [{"order": [C1, C2, C3], "title": "Memo"}]
+    parts = store.run_read_query("MATCH (:Chunk)-[:PART_OF]->(d:Document) RETURN count(*) AS n").rows
+    assert parts == [{"n": 3}]
+
+
+def test_aliases_follow_mentions_and_leave_with_the_document(store):
+    canonical = _resolved("Acme Holdings Inc.", key="Organization:acme holdings")
+    store.replace_source(DocumentMetadata(source_id="a"), _chunks("a", C1),
+                         [_row(C1, "a", canonical, "ACQUIRED", _resolved("Beta"))])
+    merged = _resolved("AHI", key="Organization:acme holdings", method=Resolution.LLM, aliases=["Acme"])
+    store.replace_source(DocumentMetadata(source_id="b"), _chunks("b", C2),
+                         [_row(C2, "b", merged, "SUPPLIES", _resolved("Gamma"))])
+
+    entity = store.run_read_query(
+        "MATCH (e:Entity {key: 'Organization:acme holdings'}) RETURN e.name AS name, e.aliases AS aliases").rows
+    assert entity == [{"name": "Acme Holdings Inc.", "aliases": ["AHI", "Acme"]}]
+    how = store.run_read_query(
+        "MATCH (:Entity {key: 'Organization:acme holdings'})-[m:MENTIONED_IN]->(c:Chunk) "
+        "RETURN m.surface AS surface, m.resolution AS method, c.chunk_id AS chunk ORDER BY surface").rows
+    assert how == [{"surface": "AHI", "method": "llm", "chunk": C2},
+                   {"surface": "Acme", "method": "stated_alias", "chunk": C2},
+                   {"surface": "Acme Holdings Inc.", "method": "new", "chunk": C1}]
+    candidates = store.find_candidates(EntityType.ORGANIZATION, ["ahi"], 10)
+    assert [c.key for c in candidates] == ["Organization:acme holdings"]  # found by alias
+    assert store.find_candidates(EntityType.PERSON, ["ahi"], 10) == []  # never across types
+
+    store.replace_source(DocumentMetadata(source_id="b"), [], [])  # the merging document is withdrawn
+    entity = store.run_read_query(
+        "MATCH (e:Entity {key: 'Organization:acme holdings'}) RETURN e.aliases AS aliases").rows
+    assert entity == [{"aliases": []}]
+
+
+def test_related_to_keeps_one_edge_per_predicate(store):
+    a, b = _resolved("A"), _resolved("B")
+    store.replace_source(DocumentMetadata(source_id="a"), _chunks("a", C1), [
+        _row(C1, "a", a, "RELATED_TO", b, original="ADMIRES"),
+        _row(C1, "a", a, "RELATED_TO", b, original="SUES"),
+        _row(C1, "a", a, "ACQUIRED", b, original="BOUGHT"),
+        _row(C1, "a", a, "ACQUIRED", b, original="PURCHASED"),
+    ])
+    edges = store.run_read_query(
+        "MATCH (:Entity {name: 'A'})-[r]->(:Entity {name: 'B'}) "
+        "RETURN type(r) AS t, r.predicate AS p, r.extracted_as AS seen ORDER BY t, p").rows
+    assert edges == [
+        {"t": "ACQUIRED", "p": None, "seen": ["BOUGHT", "PURCHASED"]},
+        {"t": "RELATED_TO", "p": "ADMIRES", "seen": ["ADMIRES"]},
+        {"t": "RELATED_TO", "p": "SUES", "seen": ["SUES"]},
+    ]
+
+
+def test_ingestion_resolves_across_documents_through_the_graph(store, settings, chunk_store):
+    from nexo.storage.ingest import KnowledgeGraphIngestor
+    from nexo.storage.resolution import EntityResolver
+    from nexo.storage.sensitive_data import NoopDetector
+    from tests.conftest import RecordingChatModel
+
+    def extraction(head, tail, evidence):
+        return json.dumps({"triples": [{"head": {"name": head, "type": "Organization", "description": "holding co"},
+                                        "relation": "acquired", "tail": {"name": tail, "type": "Organization"},
+                                        "evidence": evidence}]})
+
+    def ingest(text, source_id, replies):
+        llm = RecordingChatModel(replies=replies)
+        ingestor = KnowledgeGraphIngestor(
+            llm=llm, chunk_store=chunk_store, graph_writer=store, detector=NoopDetector(), settings=settings,
+            resolver=EntityResolver(catalog=store, llm=llm, mode="llm"))
+        return ingestor.ingest(text, DocumentMetadata(source_id=source_id)), llm
+
+    ingest("# A\n\nAcme Holdings Inc. acquired Beta Labs.", "a",
+           [extraction("Acme Holdings Inc.", "Beta Labs", "Acme Holdings Inc. acquired Beta Labs")])
+    report, llm = ingest("# B\n\nAcme Hldgs acquired Gamma Corp.", "b", [
+        extraction("Acme Hldgs", "Gamma Corp", "Acme Hldgs acquired Gamma Corp"),
+        json.dumps({"decisions": [{"mention": 0, "match": "Organization:acme holdings"}]}),
+    ])
+    # The resolver was shown the existing entity, found by the real token-blocking query.
+    assert "Organization:acme holdings" in llm.prompts[1][-1].content
+    assert report.resolution["llm"] == 1
+    acme = store.run_read_query(
+        "MATCH (e:Entity {key: 'Organization:acme holdings'})-[r:ACQUIRED]->(t) WITH e, t ORDER BY t.name "
+        "RETURN e.aliases AS aliases, collect(t.name) AS targets").rows
+    assert acme == [{"aliases": ["Acme Hldgs"], "targets": ["Beta Labs", "Gamma Corp"]}]
+    assert store.run_read_query("MATCH (e:Entity) WHERE e.name STARTS WITH 'Acme' RETURN count(e) AS n").rows == [
+        {"n": 1}]
 
 
 def test_read_transaction_rejects_writes_server_side(store):
@@ -74,17 +188,23 @@ def test_read_transaction_rejects_writes_server_side(store):
         store.run_read_query("CREATE (:Entity {key: 'x'})")  # guard bypassed: the server still refuses
 
 
-def test_row_cap_and_tool_against_real_graph(store, settings):
-    store.replace_source("a", [GroundedTriple(triple=_triple(f"Org{i}", "partners_with", "Hub", f"Org{i} partners"),
-                                              chunk_id=C1, source_id="a", sensitivity=Sensitivity.INTERNAL)
-                               for i in range(60)])
+def test_row_cap_tool_redaction_and_db_span(store, settings, spans):
+    hub = _resolved("Hub")
+    store.replace_source(DocumentMetadata(source_id="a"), _chunks("a", C1),
+                         [_row(C1, "a", _resolved(f"Org{i}"), "PARTNERS_WITH", hub) for i in range(60)])
     assert store.run_read_query("MATCH (e:Entity) RETURN e.name").truncated is True
     ctx = InvestigationContext(request_id="r", max_tool_calls=5,
                                scope=InvestigationScope(chunk_filter=ChunkFilter(max_sensitivity=Sensitivity.PUBLIC)))
     query, _ = build_investigation_tools(graph=store, chunks=None, ctx=ctx, settings=settings)
+    spans.clear()
     out = json.loads(query("MATCH (e:Entity {name: 'Hub'}) RETURN e"))
     assert out["rows"] == [{"e": {"redacted": "above caller clearance"}}]  # internal > public
-    assert "PARTNERS_WITH" in store.describe_schema()
+    [db_span] = [s for s in spans.get_finished_spans() if s.name == "agent_query"]
+    assert db_span.kind is SpanKind.CLIENT
+    assert db_span.attributes["db.system.name"] == "neo4j" and db_span.attributes["db.namespace"] == "neo4j"
+    assert db_span.attributes["server.address"] == "127.0.0.1"
+    assert "db.query.text" not in db_span.attributes  # content capture is off by default
+    assert "(:Organization)-[:PARTNERS_WITH]->(:Organization)  x60" in store.describe_schema()
 
 
 def _last_tool_payload(request: dict) -> dict:

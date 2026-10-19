@@ -11,7 +11,9 @@ The Strands agent owns the open-ended reasoning inside `investigator`.
 
 from __future__ import annotations
 
+import functools
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -59,6 +61,32 @@ reason: one sentence, no quotes from the request."""
 class InvestigatorRunner(Protocol):
     def investigate(self, query: str, *, request_id: str | None = None,
                     scope: InvestigationScope | None = None) -> AgentOutput: ...
+
+
+def traced_node(name: str, fn: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
+    """Run a node inside a current span recording the state keys it changed.
+
+    Being the current span (not a callback-side span) makes the LLM, agent and
+    tool spans started inside the node its children.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+        thread_id = (config.get("configurable") or {}).get("thread_id")
+        with traced_span(f"langgraph.node {name}",
+                         {"langgraph.node": name, "gen_ai.conversation.id": thread_id}) as span:
+            try:
+                update = fn(state, config)
+            except GraphBubbleUp:
+                # A human-in-the-loop pause is control flow, not a failure.
+                span.set_attribute("langgraph.interrupted", True)
+                raise
+            changed = sorted(update)
+            span.set_attribute("langgraph.state_update.keys", changed)
+            span.add_event("graph.state_change", {"state.keys": changed})
+            return update
+
+    return wrapper
 
 
 @dataclass(frozen=True)
@@ -122,17 +150,16 @@ def build_graph(deps: GraphDependencies, checkpointer: BaseCheckpointSaver) -> C
     # retry the whole investigation; its tools are read-only, so that is safe.
     @task(name="strands_investigation", retry_policy=RetryPolicy(max_attempts=2, retry_on=is_transient))
     def strands_investigation(user_query: str, request_id: str, scope: dict[str, Any]) -> dict[str, Any]:
-        # LangGraph runs tasks with the caller's contextvars, so this span is a
-        # child of the request span and parents every Strands span below it.
-        with traced_span("investigator.strands_agent", {"request.id": request_id}):
-            # ===== HANDOFF: LangGraph yields control to the Strands agent here =====
-            output = deps.investigator.investigate(
-                user_query, request_id=request_id, scope=InvestigationScope.model_validate(scope)
-            )
-            # ===== Strands returns control: autonomous loop finished =====
+        # LangGraph runs tasks with the caller's contextvars, so Strands'
+        # `invoke_agent` span becomes a child of the investigator node span.
+        # ===== HANDOFF: LangGraph yields control to the Strands agent here =====
+        output = deps.investigator.investigate(
+            user_query, request_id=request_id, scope=InvestigationScope.model_validate(scope)
+        )
+        # ===== Strands returns control: autonomous loop finished =====
         return output.model_dump(mode="json")
 
-    def investigator(state: GraphState) -> dict[str, Any]:
+    def investigator(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         try:
             output = strands_investigation(
                 state["user_query"], state["request_id"], state.get("investigation_scope") or {}
@@ -146,7 +173,7 @@ def build_graph(deps: GraphDependencies, checkpointer: BaseCheckpointSaver) -> C
         return {"agent_outputs": [output]}
 
     # ------------------------------------------------------------------ Node 3
-    def compliance(state: GraphState) -> dict[str, Any]:
+    def compliance(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         # Everything before interrupt() re-runs on resume: keep it pure.
         outputs = state.get("agent_outputs") or []
         latest = AgentOutput.model_validate(outputs[-1]) if outputs else None
@@ -185,9 +212,9 @@ def build_graph(deps: GraphDependencies, checkpointer: BaseCheckpointSaver) -> C
         }
 
     builder = StateGraph(GraphState)
-    builder.add_node("router", router)
-    builder.add_node("investigator", investigator)
-    builder.add_node("compliance", compliance)
+    builder.add_node("router", traced_node("router", router))
+    builder.add_node("investigator", traced_node("investigator", investigator))
+    builder.add_node("compliance", traced_node("compliance", compliance))
     builder.add_edge(START, "router")
     builder.add_conditional_edges("router", lambda s: s["routing_target"],
                                   {"investigator": "investigator", "rejected": END})

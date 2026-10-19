@@ -18,11 +18,15 @@ dependencies = [
     "tenacity>=9.2,<10",
     "opentelemetry-sdk>=1.45,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.45,<2",
+    # Official GenAI instrumentation of the openai SDK (all vLLM calls). Beta:
+    # pinned with its util package; do not also install instrumentation-openai-v2.
+    "opentelemetry-instrumentation-genai-openai==1.2b0",
+    "opentelemetry-util-genai==1.2b0",
 ]
 
 [project.optional-dependencies]
 postgres = ["langgraph-checkpoint-postgres>=3,<4", "psycopg[binary,pool]>=3.2,<4"]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6", "pyyaml>=6"]
 aws = ["boto3>=1.35,<2"]
 
 [project.scripts]

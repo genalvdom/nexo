@@ -1,15 +1,17 @@
 """Neo4j access over the Bolt driver.
 
-Data model (every node and edge carries the chunk(s) it came from):
+Two layers share one graph (the "lexical graph" + "domain graph" pattern of
+Neo4j's LLM Graph Builder):
 
-    (:Entity:<EntityType> {key, name, type, description, chunk_id, chunk_ids,
-                           source_ids, max_sensitivity_rank, proposed_codes_json})
-    (:Chunk {chunk_id, source_id, sensitivity})
-    (:Entity)-[:<PREDICATE> {chunk_id, chunk_ids, evidence, certainty, valid_at}]->(:Entity)
-    (:Entity)-[:MENTIONED_IN]->(:Chunk)
+    (:Document {source_id, title, doc_type, source_uri, effective_date, sensitivity})
+    (:Document)-[:FIRST_CHUNK]->(:Chunk)-[:NEXT_CHUNK]->(:Chunk)-[:PART_OF]->(:Document)
+    (:Entity:<EntityType>[:PII][:PHI])-[:MENTIONED_IN {surface, resolution}]->(:Chunk)
+    (:Entity)-[:<RELATION> {chunk_id, chunk_ids, evidence, certainty, valid_at, extracted_as}]->(:Entity)
 
-`chunk_id` is the chunk where the entity/edge was first extracted and
-`chunk_ids` accumulates every supporting chunk across documents.
+`chunk_id` is the chunk where an entity/edge was first extracted;
+`chunk_ids` accumulates every supporting chunk across documents. Entity
+`aliases` are derived from the surfaces on MENTIONED_IN, so withdrawing a
+document also withdraws the aliases (and merges) it contributed.
 """
 
 from __future__ import annotations
@@ -20,20 +22,28 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, LiteralString, cast
+from urllib.parse import urlparse
 
 from neo4j import READ_ACCESS, WRITE_ACCESS, Driver, GraphDatabase, ManagedTransaction, unit_of_work
 from neo4j.exceptions import ServiceUnavailable, SessionExpired
+from opentelemetry.trace import SpanKind
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 from nexo.config import Settings
-from nexo.storage.schemas import RELATION_RE, EntityType, GroundedTriple
+from nexo.storage.ontology import FALLBACK_RELATION
+from nexo.storage.resolution import Candidate
+from nexo.storage.schemas import RELATION_RE, ChunkRecord, DocumentMetadata, EntityType, GroundedTriple
+from nexo.telemetry import traced_span
 
 DATA_MODEL = """\
-(:Entity:<EntityType>[:PII][:PHI] {key, name, type, description, chunk_id, chunk_ids, source_ids,
+(:Document {source_id, title, doc_type, source_uri, effective_date, sensitivity})
+(:Document)-[:FIRST_CHUNK]->(:Chunk {chunk_id, source_id, ordinal, section_path, sensitivity})
+(:Chunk)-[:NEXT_CHUNK]->(:Chunk), (:Chunk)-[:PART_OF]->(:Document)
+(:Entity:<EntityType>[:PII][:PHI] {key, name, aliases, type, description, chunk_id, chunk_ids, source_ids,
                                   max_sensitivity_rank, proposed_codes_json})
-(:Chunk {chunk_id, source_id, sensitivity})
-(:Entity)-[:<PREDICATE> {chunk_id, chunk_ids, evidence, certainty, valid_at}]->(:Entity)
-(:Entity)-[:MENTIONED_IN]->(:Chunk)
+(:Entity)-[:MENTIONED_IN {surface, resolution}]->(:Chunk)
+(:Entity)-[:<RELATION> {chunk_id, chunk_ids, evidence, certainty, valid_at, extracted_as}]->(:Entity)
+(:Entity)-[:RELATED_TO {predicate, ...same properties}]->(:Entity)   # predicate outside the ontology
 EntityType is one of: """ + ", ".join(t.value for t in EntityType) + """
 max_sensitivity_rank: 0=public 1=internal 2=pii 3=phi"""
 
@@ -49,8 +59,11 @@ _connection_retry = retry(
 _SCHEMA_STATEMENTS: tuple[LiteralString, ...] = (
     "CREATE CONSTRAINT entity_key IF NOT EXISTS FOR (e:Entity) REQUIRE e.key IS UNIQUE",
     "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE",
+    "CREATE CONSTRAINT document_source_id IF NOT EXISTS FOR (d:Document) REQUIRE d.source_id IS UNIQUE",
     "CREATE INDEX entity_chunk_id IF NOT EXISTS FOR (e:Entity) ON (e.chunk_id)",
-    "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)",
+    "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.type)",
+    # Text index: serves CONTAINS lookups for agent queries and resolution blocking.
+    "CREATE TEXT INDEX entity_name_text IF NOT EXISTS FOR (e:Entity) ON (e.name)",
 )
 
 
@@ -61,11 +74,15 @@ class ReadResult:
 
 
 class GraphStore:
-    def __init__(self, driver: Driver, *, database: str, query_timeout_s: float, max_rows: int) -> None:
+    def __init__(self, driver: Driver, *, database: str, query_timeout_s: float, max_rows: int,
+                 capture_query_text: bool = False, uri: str | None = None) -> None:
         self._driver = driver
         self._database = database
         self._query_timeout_s = query_timeout_s
         self._max_rows = max_rows
+        self._capture_query_text = capture_query_text
+        address = urlparse(uri or "")
+        self._server = {"server.address": address.hostname, "server.port": address.port}
 
     @classmethod
     def from_settings(cls, settings: Settings, *, read_only: bool) -> GraphStore:
@@ -83,10 +100,21 @@ class GraphStore:
             database=settings.neo4j_database,
             query_timeout_s=settings.neo4j_query_timeout_s,
             max_rows=settings.neo4j_max_rows,
+            capture_query_text=settings.capture_content,
+            uri=settings.neo4j_uri,
         )
 
     def close(self) -> None:
         self._driver.close()
+
+    def _span(self, query_summary: str, query_text: str | None = None):
+        """CLIENT span per the OTEL database conventions (db.system.name=neo4j)."""
+        attributes = {"db.system.name": "neo4j", "db.namespace": self._database, "db.query.summary": query_summary,
+                      **self._server}
+        if query_text is not None and self._capture_query_text:
+            # Agent-authored Cypher is not parameterized and may carry names: opt-in only.
+            attributes["db.query.text"] = query_text[:4000]
+        return traced_span(query_summary, attributes, kind=SpanKind.CLIENT)
 
     @_connection_retry
     def verify(self) -> None:
@@ -100,19 +128,45 @@ class GraphStore:
 
     # --- writes (ingestion) ------------------------------------------------------
     @_connection_retry
-    def replace_source(self, source_id: str, triples: Sequence[GroundedTriple]) -> int:
-        """Swap a document's subgraph atomically: detach the previous version's
-        provenance (dropping what only it supported), then upsert the new triples."""
-        entities, chunks, mentions, relations = _plan_writes(triples)
+    def replace_source(self, document: DocumentMetadata, chunks: Sequence[ChunkRecord],
+                       triples: Sequence[GroundedTriple]) -> int:
+        """Swap a document's lexical and domain subgraph in one transaction.
+
+        Detaches the previous version's provenance (dropping what only it
+        supported), writes Document/Chunk nodes, then upserts the new triples.
+        """
+        plan = _plan_writes(triples)
 
         def work(tx: ManagedTransaction) -> None:
-            _delete_source(tx, source_id)
+            affected = _delete_source(tx, document.source_id)
+            if chunks:
+                _write_lexical(tx, document, chunks)
             if triples:
-                _write_batch(tx, entities, chunks, mentions, relations)
+                _write_domain(tx, *plan)
+            _refresh_aliases(tx, sorted(affected | {row["key"] for row in plan[1]}))
 
-        with self._driver.session(database=self._database, default_access_mode=WRITE_ACCESS) as session:
+        with self._span("replace_source"), \
+                self._driver.session(database=self._database, default_access_mode=WRITE_ACCESS) as session:
             session.execute_write(work)
         return len(triples)
+
+    @_connection_retry
+    def find_candidates(self, entity_type: EntityType, tokens: Sequence[str], limit: int) -> list[Candidate]:
+        """Resolution blocking: same-type entities whose name or alias contains a token."""
+        with self._span("find_candidates"), \
+                self._driver.session(database=self._database, default_access_mode=READ_ACCESS) as session:
+            records = session.execute_read(lambda tx: list(tx.run(
+                """
+                MATCH (e:Entity) WHERE e.type = $type
+                  AND any(t IN $tokens WHERE toLower(e.name) CONTAINS t
+                          OR any(a IN coalesce(e.aliases, []) WHERE toLower(a) CONTAINS t))
+                RETURN e.key AS key, e.name AS name, coalesce(e.aliases, []) AS aliases,
+                       coalesce(e.description, '') AS description
+                LIMIT $limit
+                """,
+                type=entity_type.value, tokens=list(tokens), limit=limit,
+            )))
+        return [Candidate(**record.data()) for record in records]
 
     # --- reads (agent tool) ----------------------------------------------------
     @_connection_retry
@@ -134,39 +188,38 @@ class GraphStore:
                 rows.append(record.data())
             return ReadResult(rows, truncated=False)
 
-        with self._driver.session(database=self._database, default_access_mode=READ_ACCESS) as session:
+        with self._span("agent_query", cypher), \
+                self._driver.session(database=self._database, default_access_mode=READ_ACCESS) as session:
             return session.execute_read(work)
 
     def describe_schema(self) -> str:
-        """Live labels and relationship types, appended to the static data model."""
+        """Static data model plus the relation patterns actually present, with counts."""
         try:
-            labels = self.run_read_query("CALL db.labels() YIELD label RETURN collect(label) AS v").rows[0]["v"]
-            rel_types = self.run_read_query(
-                "CALL db.relationshipTypes() YIELD relationshipType RETURN collect(relationshipType) AS v"
-            ).rows[0]["v"]
+            patterns = self.run_read_query(
+                "MATCH (a:Entity)-[r]->(b:Entity) "
+                "RETURN a.type AS source, type(r) AS relation, b.type AS target, count(*) AS n "
+                "ORDER BY n DESC LIMIT 60"
+            ).rows
         except Exception:  # schema hints are best effort; the agent can still explore
             return DATA_MODEL
-        return f"{DATA_MODEL}\n\nLabels present: {sorted(labels)}\nRelationship types present: {sorted(rel_types)}"
+        if not patterns:
+            return DATA_MODEL
+        lines = [f"(:{p['source']})-[:{p['relation']}]->(:{p['target']})  x{p['n']}" for p in patterns]
+        return f"{DATA_MODEL}\n\nRelation patterns present (direction matters):\n" + "\n".join(lines)
 
 
 def _plan_writes(triples: Sequence[GroundedTriple]):
     entities: dict[str, dict[str, Any]] = {}
-    chunks: dict[str, dict[str, Any]] = {}
-    mentions: set[tuple[str, str]] = set()
+    mentions: dict[tuple[str, str, str], dict[str, Any]] = {}
     relations: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for grounded in triples:
-        t = grounded.triple
-        chunks[grounded.chunk_id] = {
-            "chunk_id": grounded.chunk_id,
-            "source_id": grounded.source_id,
-            "sensitivity": grounded.sensitivity.value,
-        }
-        for ref in (t.head, t.tail):
+        for resolved in (grounded.head, grounded.tail):
+            ref = resolved.ref
             row = entities.setdefault(
-                f"{ref.key}\x1f{grounded.chunk_id}",
+                f"{resolved.key}\x1f{grounded.chunk_id}",
                 {
-                    "key": ref.key,
-                    "name": ref.name,
+                    "key": resolved.key,
+                    "name": ref.name,  # only used when the entity is new
                     "type": ref.type.value,
                     "description": ref.description,
                     "chunk_id": grounded.chunk_id,
@@ -176,35 +229,62 @@ def _plan_writes(triples: Sequence[GroundedTriple]):
                 },
             )
             row["description"] = row["description"] or ref.description
-            mentions.add((ref.key, grounded.chunk_id))
-        if not RELATION_RE.fullmatch(t.relation):  # schema validator guarantees this; defence in depth
-            raise ValueError(f"unsafe relationship type {t.relation!r}")
-        relations[t.relation].append(
-            {
-                "head_key": t.head.key,
-                "tail_key": t.tail.key,
-                "chunk_id": grounded.chunk_id,
-                "evidence": t.evidence,
-                "certainty": t.certainty.value,
-                "valid_at": t.valid_at.isoformat() if t.valid_at else None,
-            }
-        )
+            for surface in {ref.name, *ref.aliases}:
+                mentions.setdefault((resolved.key, grounded.chunk_id, surface), {
+                    "key": resolved.key, "chunk_id": grounded.chunk_id, "surface": surface,
+                    "method": resolved.method.value if surface == ref.name else "stated_alias",
+                })
+        if not RELATION_RE.fullmatch(grounded.relation):  # defence in depth for the f-string below
+            raise ValueError(f"unsafe relationship type {grounded.relation!r}")
+        t = grounded.triple
+        relations[grounded.relation].append({
+            "head_key": grounded.head.key,
+            "tail_key": grounded.tail.key,
+            "chunk_id": grounded.chunk_id,
+            "evidence": t.evidence,
+            "certainty": t.certainty.value,
+            "valid_at": t.valid_at.isoformat() if t.valid_at else None,
+            "predicate": grounded.original_relation or grounded.relation,
+        })
     by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in entities.values():
         by_label[row["type"]].append(row)
-    mention_rows = [{"key": k, "chunk_id": c} for k, c in sorted(mentions)]
-    return by_label, list(chunks.values()), mention_rows, relations
+    return by_label, list(mentions.values()), relations
 
 
-def _write_batch(tx: ManagedTransaction, entities, chunks, mentions, relations) -> None:
+def _write_lexical(tx: ManagedTransaction, document: DocumentMetadata, chunks: Sequence[ChunkRecord]) -> None:
     tx.run(
         """
-        UNWIND $rows AS row
+        MERGE (d:Document {source_id: $doc.source_id})
+        SET d.title = $doc.title, d.doc_type = $doc.doc_type, d.source_uri = $doc.source_uri,
+            d.effective_date = $doc.effective_date, d.sensitivity = $doc.sensitivity
+        WITH d
+        UNWIND $chunks AS row
         MERGE (c:Chunk {chunk_id: row.chunk_id})
-        SET c.source_id = row.source_id, c.sensitivity = row.sensitivity
+        SET c.source_id = $doc.source_id, c.ordinal = row.ordinal, c.section_path = row.section_path,
+            c.sensitivity = row.sensitivity
+        MERGE (c)-[:PART_OF]->(d)
         """,
-        rows=chunks,
+        doc=document.model_dump(mode="json"),
+        chunks=[{"chunk_id": c.chunk_id, "ordinal": c.ordinal, "section_path": c.section_path,
+                 "sensitivity": c.sensitivity.value} for c in chunks],
     ).consume()
+    ordered = sorted(chunks, key=lambda c: c.ordinal)
+    tx.run(
+        """
+        MATCH (d:Document {source_id: $source_id}), (first:Chunk {chunk_id: $first})
+        MERGE (d)-[:FIRST_CHUNK]->(first)
+        WITH 1 AS done
+        UNWIND $pairs AS pair
+        MATCH (a:Chunk {chunk_id: pair[0]}), (b:Chunk {chunk_id: pair[1]})
+        MERGE (a)-[:NEXT_CHUNK]->(b)
+        """,
+        source_id=document.source_id, first=ordered[0].chunk_id,
+        pairs=[[a.chunk_id, b.chunk_id] for a, b in zip(ordered, ordered[1:], strict=False)],
+    ).consume()
+
+
+def _write_domain(tx: ManagedTransaction, entities, mentions, relations) -> None:
     for label, rows in entities.items():
         # Labels cannot be parameters; only closed-enum literals reach here.
         EntityType(label)
@@ -215,7 +295,7 @@ def _write_batch(tx: ManagedTransaction, entities, chunks, mentions, relations) 
                 UNWIND $rows AS row
                 MERGE (e:Entity {{key: row.key}})
                   ON CREATE SET e.name = row.name, e.type = row.type, e.chunk_id = row.chunk_id,
-                                e.chunk_ids = [], e.source_ids = [], e.description = row.description,
+                                e.chunk_ids = [], e.source_ids = [], e.aliases = [], e.description = row.description,
                                 e.max_sensitivity_rank = row.sensitivity_rank, e.proposed_codes_json = row.codes,
                                 e.created_at = datetime()
                 SET e:`{label}`,
@@ -236,31 +316,44 @@ def _write_batch(tx: ManagedTransaction, entities, chunks, mentions, relations) 
         """
         UNWIND $rows AS row
         MATCH (e:Entity {key: row.key}), (c:Chunk {chunk_id: row.chunk_id})
-        MERGE (e)-[:MENTIONED_IN]->(c)
+        MERGE (e)-[m:MENTIONED_IN {surface: row.surface}]->(c)
+        SET m.resolution = row.method
         """,
         rows=mentions,
     ).consume()
     for rel_type, rows in relations.items():
+        # RELATED_TO keeps one edge per distinct out-of-ontology predicate.
+        identity = "{predicate: row.predicate}" if rel_type == FALLBACK_RELATION else ""
         tx.run(
             cast(
                 LiteralString,
                 f"""
                 UNWIND $rows AS row
                 MATCH (h:Entity {{key: row.head_key}}), (t:Entity {{key: row.tail_key}})
-                MERGE (h)-[r:`{rel_type}`]->(t)
-                  ON CREATE SET r.chunk_id = row.chunk_id, r.chunk_ids = [], r.evidence = row.evidence,
-                                r.certainty = row.certainty, r.valid_at = row.valid_at, r.created_at = datetime()
-                SET r.chunk_ids = CASE WHEN row.chunk_id IN r.chunk_ids THEN r.chunk_ids ELSE r.chunk_ids + row.chunk_id END
+                MERGE (h)-[r:`{rel_type}` {identity}]->(t)
+                  ON CREATE SET r.chunk_id = row.chunk_id, r.chunk_ids = [], r.extracted_as = [],
+                                r.evidence = row.evidence, r.certainty = row.certainty, r.valid_at = row.valid_at,
+                                r.created_at = datetime()
+                SET r.chunk_ids = CASE WHEN row.chunk_id IN r.chunk_ids THEN r.chunk_ids ELSE r.chunk_ids + row.chunk_id END,
+                    r.extracted_as = CASE WHEN row.predicate IN r.extracted_as THEN r.extracted_as
+                                          ELSE r.extracted_as + row.predicate END
                 """,
             ),
             rows=rows,
         ).consume()
 
 
-def _delete_source(tx: ManagedTransaction, source_id: str) -> None:
-    stale = tx.run(
-        "MATCH (c:Chunk {source_id: $source_id}) RETURN collect(c.chunk_id) AS ids", source_id=source_id
-    ).single(strict=True)["ids"]
+def _delete_source(tx: ManagedTransaction, source_id: str) -> set[str]:
+    """Remove a document's provenance; returns keys of entities it touched."""
+    record = tx.run(
+        """
+        OPTIONAL MATCH (c:Chunk {source_id: $source_id})
+        OPTIONAL MATCH (e:Entity)-[:MENTIONED_IN]->(c)
+        RETURN collect(DISTINCT c.chunk_id) AS ids, collect(DISTINCT e.key) AS keys
+        """,
+        source_id=source_id,
+    ).single(strict=True)
+    stale, affected = record["ids"], set(record["keys"])
     statements: tuple[LiteralString, ...] = (
         # Remove the document's chunks from edge/entity provenance ...
         """MATCH ()-[r]->() WHERE any(id IN r.chunk_ids WHERE id IN $stale)
@@ -271,6 +364,7 @@ def _delete_source(tx: ManagedTransaction, source_id: str) -> None:
         # ... drop whatever only this document supported ...
         "MATCH ()-[r]->() WHERE r.chunk_ids = [] DELETE r",
         "MATCH (c:Chunk {source_id: $source_id}) DETACH DELETE c",
+        "MATCH (d:Document {source_id: $source_id}) DETACH DELETE d",
         "MATCH (e:Entity) WHERE e.chunk_ids = [] DETACH DELETE e",
         # ... and re-point first-seen chunk_id where that chunk is gone.
         "MATCH (e:Entity) WHERE NOT e.chunk_id IN e.chunk_ids SET e.chunk_id = e.chunk_ids[0]",
@@ -278,6 +372,21 @@ def _delete_source(tx: ManagedTransaction, source_id: str) -> None:
     )
     for statement in statements:
         tx.run(statement, stale=stale, source_id=source_id).consume()
+    return affected
+
+
+def _refresh_aliases(tx: ManagedTransaction, keys: Sequence[str]) -> None:
+    tx.run(
+        """
+        UNWIND $keys AS key
+        MATCH (e:Entity {key: key})
+        SET e.aliases = COLLECT {
+            MATCH (e)-[m:MENTIONED_IN]->(:Chunk) WHERE m.surface <> e.name
+            RETURN DISTINCT m.surface AS surface ORDER BY surface
+        }
+        """,
+        keys=list(keys),
+    ).consume()
 
 
 _WRITE_KEYWORDS = re.compile(

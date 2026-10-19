@@ -15,7 +15,7 @@ from nexo.agents.models import AgentOutput, InvestigationScope
 from nexo.orchestration.graph import GraphDependencies, build_graph
 from nexo.service import Runtime, open_checkpointer
 from nexo.storage.sensitive_data import RegexDetector
-from nexo.telemetry import OTelCallbackHandler
+from nexo.telemetry import get_tracer
 
 CHUNK = "chk_" + "a" * 16
 
@@ -46,8 +46,7 @@ def route(target="investigator", **extra) -> AIMessage:
 def runtime(settings, investigator, router_replies=None, checkpointer=None) -> Runtime:
     router = GenericFakeChatModel(messages=iter(router_replies)) if router_replies is not None else None
     deps = GraphDependencies(settings=settings, investigator=investigator, detector=RegexDetector(), router_llm=router)
-    return Runtime(graph=build_graph(deps, checkpointer or InMemorySaver()), settings=settings,
-                   callbacks=[OTelCallbackHandler()])
+    return Runtime(graph=build_graph(deps, checkpointer or InMemorySaver()), settings=settings)
 
 
 def test_happy_path_pauses_for_review_then_releases_answer(settings):
@@ -160,14 +159,52 @@ def test_review_survives_process_restart_with_sqlite(settings):
     assert done.approval_status == "approved" and investigator.calls == []
 
 
-def test_trace_covers_request_nodes_and_handoff(settings, spans):
-    rt = runtime(settings, FakeInvestigator([grounded_output()]))
+def test_trace_follows_genai_conventions_across_the_handoff(settings, spans):
+    class SpanningInvestigator(FakeInvestigator):
+        def investigate(self, query, *, request_id=None, scope=None):
+            with get_tracer().start_as_current_span("invoke_agent relationship-investigator"):  # as Strands does
+                return super().investigate(query, request_id=request_id, scope=scope)
+
+    rt = runtime(settings, SpanningInvestigator([grounded_output()]))
     rt.start("q", thread_id="t12")
     finished = {s.name: s for s in spans.get_finished_spans()}
-    assert {"nexo.request", "langgraph.node router", "langgraph.node investigator",
-            "langgraph.node compliance", "investigator.strands_agent"} <= set(finished)
-    request = finished["nexo.request"]
-    handoff = finished["investigator.strands_agent"]
-    assert handoff.context.trace_id == request.context.trace_id  # one trace across the task boundary
-    assert any(e.name == "graph.interrupt" for e in request.events)
-    assert finished["langgraph.node compliance"].attributes.get("langgraph.interrupted") is True
+    workflow = finished["invoke_workflow nexo-investigation"]
+    assert workflow.attributes["gen_ai.operation.name"] == "invoke_workflow"
+    assert workflow.attributes["gen_ai.conversation.id"] == "t12"
+    nodes = {n: finished[f"langgraph.node {n}"] for n in ("router", "investigator", "compliance")}
+    assert all(span.parent.span_id == workflow.context.span_id for span in nodes.values())
+    # The agent span started inside the @task is a child of the investigator node.
+    assert finished["invoke_agent relationship-investigator"].parent.span_id == \
+        nodes["investigator"].context.span_id
+    assert nodes["router"].attributes["langgraph.state_update.keys"] == (
+        "approval_status", "investigation_scope", "request_id", "routing_reason", "routing_target")
+    assert nodes["compliance"].attributes.get("langgraph.interrupted") is True
+    assert any(e.name == "graph.interrupt" for e in workflow.events)
+
+
+def test_openai_instrumentation_emits_one_chat_span_per_vllm_call(settings, spans):
+    from langchain_openai import ChatOpenAI
+    from opentelemetry.trace import SpanKind
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = {"id": "c1", "object": "chat.completion", "created": 0, "model": "llama",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                    "role": "assistant", "content": json.dumps({"target": "investigator", "reason": "ok"})}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}}
+        return httpx.Response(200, json=body)
+
+    router = ChatOpenAI(base_url="http://vllm-inference-service:8000/v1", api_key="x", model="llama", max_retries=0,
+                        http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    deps = GraphDependencies(settings=settings, investigator=FakeInvestigator([grounded_output()]),
+                             detector=RegexDetector(), router_llm=router)
+    Runtime(graph=build_graph(deps, InMemorySaver()), settings=settings).start("q", thread_id="t13")
+
+    chats = [s for s in spans.get_finished_spans() if s.name == "chat llama"]
+    assert len(chats) == 1  # no duplicate inference spans
+    chat = chats[0]
+    router_node = next(s for s in spans.get_finished_spans() if s.name == "langgraph.node router")
+    assert chat.kind is SpanKind.CLIENT and chat.parent.span_id == router_node.context.span_id
+    assert chat.attributes["gen_ai.operation.name"] == "chat"
+    assert chat.attributes["server.address"] == "vllm-inference-service"
+    assert chat.attributes["gen_ai.usage.input_tokens"] == 7
+    assert not any(k.startswith("gen_ai.input.messages") for k in chat.attributes)  # content off by default

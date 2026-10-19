@@ -6,26 +6,48 @@ receivers:
 
 processors:
   batch: {}
-  # Belt and braces with OTEL_CAPTURE_CONTENT=false: never ship prompt/answer
-  # bodies even if a library records them.
+  # Second line behind OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=no_content:
+  # never export GenAI message content, even if a library records it.
   attributes/strip-content:
     actions:
-      - { key: gen_ai.prompt, action: delete }
-      - { key: gen_ai.completion, action: delete }
-      - { key: gen_ai.tool.input, action: delete }
+      - { key: gen_ai.input.messages, action: delete }
+      - { key: gen_ai.output.messages, action: delete }
+      - { key: gen_ai.system_instructions, action: delete }
+      - { key: gen_ai.tool.call.arguments, action: delete }
+      - { key: gen_ai.tool.call.result, action: delete }
+      - { key: gen_ai.prompt, action: delete }          # legacy
+      - { key: gen_ai.completion, action: delete }      # legacy
+      - { key: db.query.text, action: delete }
+  # Strands and older instrumentations put content in span events.
+  filter/strip-content-events:
+    error_mode: ignore
+    traces:
+      spanevent:
+        - 'IsMatch(name, "^gen_ai\\.(system|user|assistant|tool)\\.message$")'
+        - 'name == "gen_ai.choice"'
+        - 'name == "gen_ai.client.inference.operation.details"'
 
 exporters:
   otlp/jaeger:
     endpoint: jaeger:4317
     tls: { insecure: true }
-  # LangSmith accepts OTLP too; uncomment to send the same traces there.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  # LangSmith (ADR-0011): uncomment and add to the traces pipeline. Keep the
+  # strip-content processors in front of it; no PHI without a BAA or self-hosting.
   # otlphttp/langsmith:
   #   endpoint: https://api.smith.langchain.com/otel
-  #   headers: { x-api-key: ${env:LANGSMITH_API_KEY} }
+  #   headers:
+  #     x-api-key: ${env:LANGSMITH_API_KEY}
+  #     Langsmith-Project: ${env:LANGSMITH_PROJECT}
 
 service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [attributes/strip-content, batch]
+      processors: [attributes/strip-content, filter/strip-content-events, batch]
       exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]

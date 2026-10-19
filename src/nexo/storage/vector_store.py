@@ -27,6 +27,9 @@ from langchain_core.vectorstores import InMemoryVectorStore
 from pydantic import BaseModel, ConfigDict
 
 from nexo.storage.schemas import ChunkRecord, Sensitivity
+from nexo.telemetry import traced_span
+
+DATA_SOURCE_ID = "nexo-chunks"
 
 
 class ChunkFilter(BaseModel):
@@ -92,8 +95,9 @@ class LocalChunkStore:
             self._persist()
 
     def get_by_ids(self, chunk_ids: Sequence[str]) -> list[ChunkRecord]:
-        with self._lock:
+        with traced_span("chunk_store get_by_ids", {"nexo.chunks.requested": len(chunk_ids)}) as span, self._lock:
             documents = self._store.get_by_ids(list(chunk_ids))
+            span.set_attribute("nexo.chunks.found", len(documents))
         by_id = {d.id: ChunkRecord.model_validate(d.metadata["record"]) for d in documents}
         return [by_id[i] for i in chunk_ids if i in by_id]
 
@@ -101,8 +105,13 @@ class LocalChunkStore:
         def _allowed(document: Document) -> bool:
             return chunk_filter.allows(ChunkRecord.model_validate(document.metadata["record"]))
 
-        with self._lock:
+        # GenAI `retrieval` operation; INTERNAL because this store is in-process
+        # (a pgvector/OpenSearch backend would be a CLIENT span).
+        attributes = {"gen_ai.operation.name": "retrieval", "gen_ai.data_source.id": DATA_SOURCE_ID,
+                      "gen_ai.retrieval.top_k": k}
+        with traced_span(f"retrieval {DATA_SOURCE_ID}", attributes) as span, self._lock:
             documents = self._store.similarity_search(query, k=k, filter=_allowed)
+            span.set_attribute("nexo.chunks.found", len(documents))
         return [ChunkRecord.model_validate(d.metadata["record"]) for d in documents]
 
     def delete_source(self, source_id: str, keep: set[str] | frozenset[str] = frozenset()) -> int:

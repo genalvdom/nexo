@@ -4,8 +4,10 @@ scripted OpenAI-compatible client (stands in for vLLM)."""
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
+import pytest
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 from openai.types.chat import ChatCompletion
 from strands.models.openai import OpenAIModel
@@ -15,6 +17,7 @@ from nexo.agents.models import InvestigationScope
 from nexo.agents.tools import InvestigationContext, build_investigation_tools
 from nexo.storage.schemas import Sensitivity
 from nexo.storage.vector_store import ChunkFilter
+from nexo.telemetry import apply_genai_env
 from tests.conftest import FakeGraph, make_chunk
 
 
@@ -99,6 +102,64 @@ class ScriptedClient:
     async def create(self, **request: Any) -> ChatCompletion:
         self.requests.append(request)
         return next(self._responses)
+
+
+def test_strands_spans_carry_conversation_and_tool_attributes(settings, chunk_store, spans):
+    evidence = make_chunk("deals", 0, "Acme Holdings acquired Beta Labs in 2024.")
+    chunk_store.upsert([evidence], [evidence.text])
+    client = ScriptedClient([
+        _tool_call("t1", "query_knowledge_graph", {"cypher_query": "MATCH (n) RETURN n.chunk_id AS c LIMIT 1"}),
+        _tool_call("t2", "fetch_vector_chunks", {"chunk_ids": [evidence.chunk_id]}),
+        _completion({"content": f"Acme acquired Beta [chunk:{evidence.chunk_id}]."}, "stop"),
+    ])
+    Investigator(model=OpenAIModel(client=client, model_id="m", stream=False),
+                 graph=FakeGraph(rows=[{"c": evidence.chunk_id}]), chunks=chunk_store, settings=settings,
+                 ).investigate("q", request_id="thread-7", scope=InvestigationScope(strategy="graph"))
+    finished = {s.name: s for s in spans.get_finished_spans()}
+    agent = finished["invoke_agent relationship-investigator"]
+    query_tool = finished["execute_tool query_knowledge_graph"]
+    fetch_tool = finished["execute_tool fetch_vector_chunks"]
+    assert agent.attributes["gen_ai.agent.name"] == "relationship-investigator"
+    assert {s.attributes["gen_ai.conversation.id"] for s in (agent, query_tool, fetch_tool)} == {"thread-7"}
+    assert query_tool.attributes["nexo.graph.rows"] == 1 and query_tool.attributes["nexo.graph.chunk_ids_found"] == 1
+    assert fetch_tool.attributes["nexo.chunks.returned"] == 1
+    assert finished["chunk_store get_by_ids"].parent.span_id == fetch_tool.context.span_id
+
+
+GENAI_ENV = ("OTEL_SEMCONV_STABILITY_OPT_IN", "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
+
+
+@pytest.fixture
+def clean_genai_env():
+    for name in GENAI_ENV:
+        os.environ.pop(name, None)
+    yield
+    for name in GENAI_ENV:  # apply_genai_env writes os.environ directly
+        os.environ.pop(name, None)
+
+
+@pytest.mark.parametrize(("capture", "content_exported"), [("no_content", False), ("span_only", True)])
+def test_message_content_reaches_traces_only_when_capture_is_on(clean_genai_env, settings, chunk_store, spans,
+                                                                monkeypatch, capture, content_exported):
+    import strands.telemetry.tracer as strands_tracer
+
+    settings.otel_instrumentation_genai_capture_message_content = capture
+    apply_genai_env(settings)
+    monkeypatch.setattr(strands_tracer, "_tracer_instance", None)  # Strands reads the env on first use
+
+    evidence = make_chunk("d", 0, "Acme Holdings acquired Beta Labs.")
+    chunk_store.upsert([evidence], [evidence.text])
+    client = ScriptedClient([
+        _tool_call("t1", "query_knowledge_graph", {"cypher_query": "MATCH (p) RETURN p.name AS name LIMIT 1"}),
+        _completion({"content": "Found it."}, "stop"),
+    ])
+    Investigator(model=OpenAIModel(client=client, model_id="m", stream=False),
+                 graph=FakeGraph(rows=[{"name": "Patient Jane Roe"}]), chunks=chunk_store, settings=settings,
+                 ).investigate("Who treated Jane Roe?", scope=InvestigationScope(strategy="graph"))
+
+    exported = json.dumps([[dict(s.attributes), [dict(e.attributes or {}) for e in s.events]]
+                           for s in spans.get_finished_spans()], default=str)
+    assert ("Jane Roe" in exported) is content_exported
 
 
 def test_strands_agent_crawls_graph_then_vectors(settings, chunk_store):

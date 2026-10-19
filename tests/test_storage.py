@@ -11,6 +11,8 @@ from nexo.storage.schemas import (
     EntityType,
     ExtractionResult,
     GroundedTriple,
+    Resolution,
+    ResolvedEntity,
     Sensitivity,
     Triple,
     entity_key,
@@ -149,12 +151,29 @@ def test_vector_store_roundtrip_filter_and_stale_delete(settings, chunk_store):
     assert [c.chunk_id for c in reopened.get_by_ids([a.chunk_id, b.chunk_id])] == [a.chunk_id]
 
 
-def test_plan_writes_dedupes_and_groups():
-    t = Triple(head=EntityRef(name="Acme", type="Organization"), relation="acquired",
-               tail=EntityRef(name="Beta", type="Organization"), evidence="Acme acquired Beta")
-    rows = [GroundedTriple(triple=t, chunk_id="chk_" + "a" * 16, source_id="s", sensitivity=Sensitivity.PII)] * 2
-    entities, chunks, mentions, relations = _plan_writes(rows)
+def test_plan_writes_dedupes_mentions_and_keeps_surface_forms():
+    acme = EntityRef(name="Acme", type="Organization", aliases=["AHI"])
+    beta = EntityRef(name="Beta", type="Organization")
+    t = Triple(head=acme, relation="acquired", tail=beta, evidence="Acme acquired Beta")
+    head = ResolvedEntity(key="Organization:acme holdings", surface="Acme", method=Resolution.ALIAS, ref=acme)
+    tail = ResolvedEntity(key="Organization:beta", surface="Beta", ref=beta)
+    row = GroundedTriple(triple=t, chunk_id="chk_" + "a" * 16, source_id="s", sensitivity=Sensitivity.PII,
+                         relation="ACQUIRED", original_relation="BOUGHT", head=head, tail=tail)
+    entities, mentions, relations = _plan_writes([row, row])
     assert list(relations) == ["ACQUIRED"] and len(relations["ACQUIRED"]) == 2
-    assert len(entities["Organization"]) == 2  # Acme + Beta, deduped per chunk
+    assert relations["ACQUIRED"][0]["head_key"] == "Organization:acme holdings"  # resolved key, not extracted
+    assert relations["ACQUIRED"][0]["predicate"] == "BOUGHT"
+    assert {e["key"] for e in entities["Organization"]} == {"Organization:acme holdings", "Organization:beta"}
     assert entities["Organization"][0]["sensitivity_rank"] == Sensitivity.PII.rank
-    assert len(chunks) == 1 and len(mentions) == 2
+    assert {(m["surface"], m["method"]) for m in mentions} == {
+        ("Acme", "alias"), ("AHI", "stated_alias"), ("Beta", "new")}
+
+
+def test_plan_writes_rejects_unsafe_relation_types():
+    ref = EntityRef(name="A", type="Organization")
+    resolved = ResolvedEntity(key="Organization:a", surface="A", ref=ref)
+    row = GroundedTriple(triple=Triple(head=ref, relation="x", tail=ref, evidence="e"), chunk_id="chk_" + "a" * 16,
+                         source_id="s", sensitivity=Sensitivity.PUBLIC, relation="X]->() DETACH DELETE (n",
+                         head=resolved, tail=resolved)
+    with pytest.raises(ValueError, match="unsafe relationship type"):
+        _plan_writes([row])

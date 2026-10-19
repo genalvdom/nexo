@@ -56,8 +56,15 @@ class Settings(BaseSettings):
     extraction_attempts: int = Field(default=3, ge=1)
     extraction_concurrency: int = Field(default=8, ge=1)
     require_grounded_evidence: bool = True
-    # Optional closed predicate ontology (JSON list); triples outside it are dropped.
-    allowed_relations: list[str] | None = None
+    # Tail of the previous chunk shown to the extractor as context (not evidence),
+    # so references like "the company" resolve across chunk boundaries.
+    extraction_context_chars: int = Field(default=500, ge=0)
+    # Relation ontology (see deploy/ontology.example.json). Unset = free-form predicates.
+    ontology_path: Path | None = None
+    # off: exact keys only; deterministic: + alias matches; llm: + model arbitration.
+    entity_resolution: Literal["off", "deterministic", "llm"] = "llm"
+    resolution_max_candidates: int = Field(default=25, ge=1)
+    resolution_batch_size: int = Field(default=30, ge=1)
     # JSON object of acronym -> expansion, appended to embedded chunk text.
     glossary_path: Path | None = None
 
@@ -95,10 +102,26 @@ class Settings(BaseSettings):
     # OTLP/HTTP base URL, e.g. http://otel-collector:4318. Unset = no export.
     otel_exporter_otlp_endpoint: str | None = None
     otel_console_export: bool = False
-    # Prompts, answers and Cypher text can carry PII; keep them out of spans
-    # unless the trace backend is cleared for that data.
-    otel_capture_content: bool = False
+    # Standard GenAI content-capture switch, shared with the OpenTelemetry GenAI
+    # instrumentations. Prompts, answers and Cypher can carry PII: keep them off
+    # spans unless the trace backend is cleared for that data.
+    otel_instrumentation_genai_capture_message_content: Literal[
+        "no_content", "span_only", "event_only", "span_and_event"] = "no_content"
+    # Strands reads this: latest GenAI conventions, and redact content attributes
+    # (an empty unredacted list) unless content capture is enabled.
+    otel_semconv_stability_opt_in: str | None = None
+    # Instrument the openai SDK (vLLM calls from LangChain and Strands) with the
+    # official GenAI instrumentation: one `chat {model}` CLIENT span per call.
+    otel_instrument_openai: bool = True
     deployment_environment: str = "dev"
+
+    # --- Logging -----------------------------------------------------------------
+    log_level: str = "INFO"
+    log_format: Literal["text", "json"] = "text"
+
+    @property
+    def capture_content(self) -> bool:
+        return self.otel_instrumentation_genai_capture_message_content in {"span_only", "span_and_event"}
 
 
 @lru_cache(maxsize=1)

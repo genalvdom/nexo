@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from datetime import date
 from pathlib import Path
 
 from nexo.config import get_settings
+from nexo.logging_setup import configure_logging
 from nexo.telemetry import shutdown_telemetry
 
+log = logging.getLogger("nexo.cli")
 
-def _print(model) -> None:
-    print(model.model_dump_json(indent=2, exclude_none=True))
+
+def _emit(message: str, model) -> None:
+    log.info(message, extra={"result": model.model_dump(mode="json", exclude_none=True)})
 
 
 def _ingest(args: argparse.Namespace) -> int:
@@ -30,15 +34,20 @@ def _ingest(args: argparse.Namespace) -> int:
     )
     with open_ingestor(get_settings()) as ingestor:
         report = ingestor.ingest(Path(args.file).read_text(encoding="utf-8"), metadata)
-    _print(report)
-    return 1 if report.failed_chunk_ids else 0
+    if report.failed_chunk_ids:
+        log.warning("ingested %s with %d failed chunks", report.source_id, len(report.failed_chunk_ids),
+                    extra={"result": report.model_dump(mode="json")})
+        return 1
+    _emit(f"ingested {report.source_id}", report)
+    return 0
 
 
 def _ask(args: argparse.Namespace) -> int:
     from nexo.service import open_runtime
 
     with open_runtime(get_settings()) as runtime:
-        _print(runtime.start(args.query, thread_id=args.thread_id, clearance=args.clearance))
+        result = runtime.start(args.query, thread_id=args.thread_id, clearance=args.clearance)
+        _emit(f"thread {result.thread_id}: {result.status}", result)
     return 0
 
 
@@ -52,7 +61,8 @@ def _review(args: argparse.Namespace) -> int:
         "acknowledged_findings": args.acknowledge_findings,
     }
     with open_runtime(get_settings()) as runtime:
-        _print(runtime.review(args.thread_id, decision))
+        result = runtime.review(args.thread_id, decision)
+        _emit(f"thread {result.thread_id}: {result.status} ({result.approval_status})", result)
     return 0
 
 
@@ -60,7 +70,8 @@ def _status(args: argparse.Namespace) -> int:
     from nexo.service import open_runtime
 
     with open_runtime(get_settings()) as runtime:
-        _print(runtime.status(args.thread_id))
+        result = runtime.status(args.thread_id)
+        _emit(f"thread {result.thread_id}: {result.status}", result)
     return 0
 
 
@@ -98,9 +109,42 @@ def _eval(args: argparse.Namespace) -> int:
                     metrics["generation.faithfulness"] = judge_faithfulness(judge, output.answer, evidence).score
                     metrics["generation.relevancy"] = judge_relevancy(judge, case["question"], output.answer).score
                 record_metrics(metrics)
-            print(json.dumps({"question": case["question"], **metrics}))
+            log.info("eval case scored", extra={"result": {"question": case["question"], **metrics}})
     finally:
         graph.close()
+    return 0
+
+
+def _eval_extraction(args: argparse.Namespace) -> int:
+    """Each JSONL line: {"text", "triples": [Triple, ...]} - scores extraction before any graph write."""
+    from nexo.evaluation import extraction_scores, grounded_key, triple_key
+    from nexo.llm import build_chat_model, build_embeddings
+    from nexo.storage.ingest import KnowledgeGraphIngestor
+    from nexo.storage.ontology import Ontology
+    from nexo.storage.schemas import DocumentMetadata, Triple
+    from nexo.storage.sensitive_data import NoopDetector
+    from nexo.storage.vector_store import LocalChunkStore
+    from nexo.telemetry import setup_telemetry
+
+    settings = get_settings()
+    setup_telemetry(settings)
+    ontology = Ontology.load(settings.ontology_path) if settings.ontology_path else None
+    ingestor = KnowledgeGraphIngestor(
+        llm=build_chat_model(settings), chunk_store=LocalChunkStore(build_embeddings(settings)),
+        graph_writer=None, detector=NoopDetector(), settings=settings, ontology=ontology,
+    )
+    totals: dict[str, list] = {"predicted": [], "gold": []}
+    for n, line in enumerate(Path(args.dataset).read_text(encoding="utf-8").splitlines()):
+        if not line.strip():
+            continue
+        case = json.loads(line)
+        predicted, _ = ingestor.extract_triples(case["text"], DocumentMetadata(source_id=f"case-{n}"))
+        pred = {grounded_key(t) for t in predicted}
+        gold = {triple_key(Triple.model_validate(t), ontology) for t in case["triples"]}
+        totals["predicted"] += [(n, *k) for k in pred]
+        totals["gold"] += [(n, *k) for k in gold]
+        log.info("extraction case scored", extra={"result": {"case": n, **extraction_scores(pred, gold)}})
+    log.info("extraction overall", extra={"result": extraction_scores(totals["predicted"], totals["gold"])})
     return 0
 
 
@@ -142,7 +186,12 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("dataset")
     evaluate.set_defaults(handler=_eval)
 
+    evaluate_extraction = sub.add_parser("eval-extraction", help="score triple extraction against gold triples")
+    evaluate_extraction.add_argument("dataset")
+    evaluate_extraction.set_defaults(handler=_eval_extraction)
+
     args = parser.parse_args(argv)
+    configure_logging(get_settings())
     try:
         return args.handler(args)
     finally:

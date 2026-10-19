@@ -16,13 +16,13 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired
+from opentelemetry import trace
 from strands import tool
 
 from nexo.agents.models import InvestigationScope, ToolCallSummary
 from nexo.config import Settings
 from nexo.storage.graph_store import ReadResult, UnsafeCypherError, validate_read_only_cypher
 from nexo.storage.schemas import CHUNK_ID_RE, ChunkRecord
-from nexo.telemetry import traced_span
 
 
 class GraphReader(Protocol):
@@ -125,36 +125,38 @@ def build_investigation_tools(
         if not ctx.reserve_call():
             return json.dumps({"error": "tool budget exhausted; write your answer from the evidence gathered"})
         started = time.perf_counter()
-        attributes = {"db.system.name": "neo4j", "db.operation.name": "READ", "request.id": ctx.request_id}
-        if settings.otel_capture_content:
-            attributes["db.query.text"] = cypher_query[:4000]
-        with traced_span("neo4j.read_query", attributes) as span:
-            try:
-                query = validate_read_only_cypher(cypher_query)
-                result = graph.run_read_query(query)
-            except UnsafeCypherError as exc:
-                return _finish(ctx, "query_knowledge_graph", started, False, str(exc),
-                               {"error": str(exc), "hint": "rewrite as a single read-only query"})
-            except (ServiceUnavailable, SessionExpired):
-                span.set_attribute("error.type", "graph_unavailable")
-                return _finish(ctx, "query_knowledge_graph", started, False, "graph unavailable",
-                               {"error": "knowledge graph unavailable; do not retry, report what you have"})
-            except Neo4jError as exc:  # syntax errors, timeouts, access-mode violations
-                return _finish(ctx, "query_knowledge_graph", started, False, exc.code or "neo4j error",
-                               {"error": exc.message or str(exc), "code": exc.code})
-            rows = _redact_above(result.rows, clearance.rank)
-            found: set[str] = set()
-            _collect_chunk_ids(rows, found)
-            with ctx._lock:
-                ctx.discovered_chunk_ids |= found
-            span.set_attributes({"db.response.returned_rows": len(rows), "db.response.truncated": result.truncated})
-            payload = {
-                "row_count": len(rows),
-                "truncated": result.truncated,
-                "rows": rows,
-                "chunk_ids_found": sorted(found),
-            }
-            return _finish(ctx, "query_knowledge_graph", started, True, f"{len(rows)} rows", payload, max_chars)
+        # Strands' `execute_tool query_knowledge_graph` span is current here; the
+        # Neo4j CLIENT span is a child created by GraphStore.
+        span = trace.get_current_span()
+        try:
+            query = validate_read_only_cypher(cypher_query)
+            result = graph.run_read_query(query)
+        except UnsafeCypherError as exc:
+            span.set_attribute("error.type", "unsafe_cypher")
+            return _finish(ctx, "query_knowledge_graph", started, False, str(exc),
+                           {"error": str(exc), "hint": "rewrite as a single read-only query"})
+        except (ServiceUnavailable, SessionExpired):
+            span.set_attribute("error.type", "graph_unavailable")
+            return _finish(ctx, "query_knowledge_graph", started, False, "graph unavailable",
+                           {"error": "knowledge graph unavailable; do not retry, report what you have"})
+        except Neo4jError as exc:  # syntax errors, timeouts, access-mode violations
+            span.set_attribute("error.type", exc.code or "neo4j_error")
+            return _finish(ctx, "query_knowledge_graph", started, False, exc.code or "neo4j error",
+                           {"error": exc.message or str(exc), "code": exc.code})
+        rows = _redact_above(result.rows, clearance.rank)
+        found: set[str] = set()
+        _collect_chunk_ids(rows, found)
+        with ctx._lock:
+            ctx.discovered_chunk_ids |= found
+        span.set_attributes({"nexo.graph.rows": len(rows), "nexo.graph.truncated": result.truncated,
+                             "nexo.graph.chunk_ids_found": len(found)})
+        payload = {
+            "row_count": len(rows),
+            "truncated": result.truncated,
+            "rows": rows,
+            "chunk_ids_found": sorted(found),
+        }
+        return _finish(ctx, "query_knowledge_graph", started, True, f"{len(rows)} rows", payload, max_chars)
 
     @tool
     def fetch_vector_chunks(chunk_ids: list[str]) -> str:
@@ -172,40 +174,41 @@ def build_investigation_tools(
         requested = list(dict.fromkeys(chunk_ids))
         well_formed = [c for c in requested if CHUNK_ID_RE.fullmatch(c)]
         valid = well_formed[: settings.agent_max_chunks_per_call]
-        with traced_span("vector_store.get_by_ids", {"db.operation.name": "GET", "chunks.requested": len(valid),
-                                                     "request.id": ctx.request_id}) as span:
-            try:
-                records = chunks.get_by_ids(valid)
-            except Exception as exc:  # store down or corrupt: tell the agent, keep the trace
-                span.record_exception(exc)
-                return _finish(ctx, "fetch_vector_chunks", started, False, type(exc).__name__,
-                               {"error": "vector store unavailable; report what you have"})
-            returned, withheld = [], []
-            sensitivity = {r.chunk_id: r.sensitivity.value for r in records}
-            for record in records:
-                if not ctx.scope.chunk_filter.allows(record):
-                    withheld.append(record.chunk_id)
-                    continue
-                returned.append({
-                    "chunk_id": record.chunk_id,
-                    "source": " > ".join([p for p in [record.title or record.source_id, *record.section_path] if p]),
-                    "effective_date": record.effective_date,
-                    "text": record.text,
-                })
-            payload = {
-                "chunks": returned,
-                "withheld": withheld,
-                "not_found": sorted(set(valid) - set(sensitivity)),
-                "invalid_ids": [c for c in requested if c not in well_formed],
-                "over_limit_not_fetched": well_formed[len(valid):],
-            }
-            text = _finish(ctx, "fetch_vector_chunks", started, True, f"{len(returned)} chunks", payload, max_chars)
-            # Only text the model actually received counts as evidence.
-            with ctx._lock:
-                ctx.fetched.update({c["chunk_id"]: sensitivity[c["chunk_id"]] for c in payload["chunks"]})
-                ctx.withheld.update(withheld)
-            span.set_attributes({"chunks.returned": len(payload["chunks"]), "chunks.withheld": len(withheld)})
-            return text
+        span = trace.get_current_span()  # Strands' `execute_tool fetch_vector_chunks` span
+        try:
+            records = chunks.get_by_ids(valid)
+        except Exception as exc:  # store down or corrupt: tell the agent, keep the trace
+            span.record_exception(exc)
+            span.set_attribute("error.type", type(exc).__name__)
+            return _finish(ctx, "fetch_vector_chunks", started, False, type(exc).__name__,
+                           {"error": "vector store unavailable; report what you have"})
+        returned, withheld = [], []
+        sensitivity = {r.chunk_id: r.sensitivity.value for r in records}
+        for record in records:
+            if not ctx.scope.chunk_filter.allows(record):
+                withheld.append(record.chunk_id)
+                continue
+            returned.append({
+                "chunk_id": record.chunk_id,
+                "source": " > ".join([p for p in [record.title or record.source_id, *record.section_path] if p]),
+                "effective_date": record.effective_date,
+                "text": record.text,
+            })
+        payload = {
+            "chunks": returned,
+            "withheld": withheld,
+            "not_found": sorted(set(valid) - set(sensitivity)),
+            "invalid_ids": [c for c in requested if c not in well_formed],
+            "over_limit_not_fetched": well_formed[len(valid):],
+        }
+        text = _finish(ctx, "fetch_vector_chunks", started, True, f"{len(returned)} chunks", payload, max_chars)
+        # Only text the model actually received counts as evidence.
+        with ctx._lock:
+            ctx.fetched.update({c["chunk_id"]: sensitivity[c["chunk_id"]] for c in payload["chunks"]})
+            ctx.withheld.update(withheld)
+        span.set_attributes({"nexo.chunks.requested": len(valid), "nexo.chunks.returned": len(payload["chunks"]),
+                             "nexo.chunks.withheld": len(withheld)})
+        return text
 
     return [query_knowledge_graph, fetch_vector_chunks]
 
