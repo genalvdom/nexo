@@ -1,0 +1,194 @@
+"""Pydantic v2 schemas for documents, chunks and extracted knowledge.
+
+Extraction follows the knowledge-graph guidance in the Anthropic Claude
+Cookbook: a closed set of entity types, specific directional predicates, only
+facts stated in the text, canonical names, and a verbatim evidence quote per
+triple so every edge can be checked against its source chunk. The AWS
+healthcare RAG guidance adds certainty and temporal qualifiers on edges and
+terminology codes on nodes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from datetime import date, datetime
+from enum import StrEnum
+from typing import Annotated, Any
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+
+SCHEMA_VERSION = "1"
+
+CHUNK_ID_PATTERN = r"^chk_[0-9a-f]{16}$"
+CHUNK_ID_RE = re.compile(CHUNK_ID_PATTERN)
+RELATION_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+
+
+class Sensitivity(StrEnum):
+    """Ordered data classification; a caller sees chunks at or below its clearance."""
+
+    PUBLIC = "public"
+    INTERNAL = "internal"
+    PII = "pii"
+    PHI = "phi"
+
+    @property
+    def rank(self) -> int:
+        return list(Sensitivity).index(self)
+
+
+class EntityType(StrEnum):
+    # Closed set: values double as Neo4j labels, so they must stay literals.
+    PERSON = "Person"
+    ORGANIZATION = "Organization"
+    LOCATION = "Location"
+    PRODUCT = "Product"
+    EVENT = "Event"
+    CONCEPT = "Concept"
+    CONDITION = "Condition"
+    MEDICATION = "Medication"
+    PROCEDURE = "Procedure"
+
+
+class CodeSystem(StrEnum):
+    ICD10CM = "ICD10CM"
+    RXNORM = "RXNORM"
+    SNOMEDCT = "SNOMEDCT"
+    MESH = "MESH"
+    UMLS = "UMLS"
+
+
+class Certainty(StrEnum):
+    ASSERTED = "asserted"
+    POSSIBLE = "possible"
+    NEGATED = "negated"
+
+
+# --- documents and chunks ---------------------------------------------------
+
+
+class DocumentMetadata(BaseModel):
+    """Document-level metadata copied onto every chunk (filterable at retrieval)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: ShortText = Field(description="Stable document id; re-ingesting the same id replaces it")
+    title: str = ""
+    doc_type: str = "general"
+    source_uri: str | None = None
+    effective_date: date | None = None
+    sensitivity: Sensitivity = Sensitivity.INTERNAL
+
+
+class ChunkRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_id: Annotated[str, StringConstraints(pattern=CHUNK_ID_PATTERN)]
+    source_id: str
+    ordinal: int = Field(ge=0)
+    text: str = Field(description="Exact source text; the evidence that extraction is checked against")
+    section_path: list[str] = Field(default_factory=list)
+    title: str = ""
+    doc_type: str = "general"
+    source_uri: str | None = None
+    effective_date: date | None = None
+    sensitivity: Sensitivity = Sensitivity.INTERNAL
+    ingested_at: datetime
+    schema_version: str = SCHEMA_VERSION
+
+    @staticmethod
+    def make_id(source_id: str, ordinal: int, text: str) -> str:
+        """Deterministic id: re-ingesting identical content is an idempotent upsert."""
+        digest = hashlib.sha256(f"{source_id}\x1f{ordinal}\x1f{text}".encode()).hexdigest()
+        return f"chk_{digest[:16]}"
+
+    def embedding_text(self, glossary_notes: str = "") -> str:
+        """Text that gets embedded: contextual header + chunk + glossary.
+
+        Prepending the document title and heading path makes a chunk
+        self-contained, which is what the AWS RAG writing guidance asks of
+        source sections.
+        """
+        header = " > ".join([p for p in [self.title, *self.section_path] if p])
+        parts = [header, self.text, glossary_notes]
+        return "\n\n".join(p for p in parts if p)
+
+    def filter_metadata(self) -> dict[str, Any]:
+        return {
+            "source_id": self.source_id,
+            "doc_type": self.doc_type,
+            "effective_date": self.effective_date.isoformat() if self.effective_date else None,
+            "sensitivity": self.sensitivity.value,
+        }
+
+
+# --- extraction ------------------------------------------------------------------
+
+
+def normalize_relation(value: str) -> str:
+    """'works for' / 'worksFor' / 'WORKS-FOR' -> 'WORKS_FOR'."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value.strip())
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", spaced).strip("_").upper()
+    if normalized and normalized[0].isdigit():
+        normalized = f"R_{normalized}"
+    return normalized
+
+
+def entity_key(name: str, entity_type: EntityType) -> str:
+    """Merge key for entity resolution: type + case/whitespace-folded name."""
+    return f"{entity_type.value}:{' '.join(name.casefold().split())}"
+
+
+class EntityRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: ShortText = Field(description="Canonical full name as written in the text, pronouns resolved")
+    type: EntityType
+    description: str = Field(default="", max_length=300, description="Short description grounded in the text")
+    proposed_codes: dict[CodeSystem, str] = Field(
+        default_factory=dict,
+        description="Terminology codes if the text states them. Unverified until checked by a terminology service.",
+    )
+
+    @property
+    def key(self) -> str:
+        return entity_key(self.name, self.type)
+
+
+class Triple(BaseModel):
+    """One entity-relation-entity fact extracted from a single chunk."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    head: EntityRef
+    relation: str = Field(description="Directional predicate in UPPER_SNAKE_CASE, e.g. ACQUIRED, PRESCRIBED")
+    tail: EntityRef
+    evidence: str = Field(min_length=1, max_length=400, description="Verbatim quote from the text supporting the fact")
+    certainty: Certainty = Certainty.ASSERTED
+    valid_at: date | None = Field(default=None, description="Date the fact holds, only if stated")
+
+    @field_validator("relation", mode="before")
+    @classmethod
+    def _normalize_relation(cls, value: str) -> str:
+        normalized = normalize_relation(str(value))
+        if not RELATION_RE.fullmatch(normalized):
+            raise ValueError(f"relation {value!r} cannot be normalized to UPPER_SNAKE_CASE")
+        return normalized
+
+
+class ExtractionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    triples: list[Triple] = Field(default_factory=list, max_length=100)
+
+
+class GroundedTriple(BaseModel):
+    """A triple bound to the chunk it was extracted from - the graph/vector link."""
+
+    triple: Triple
+    chunk_id: str
+    source_id: str
+    sensitivity: Sensitivity

@@ -9,6 +9,7 @@ dependencies = [
     "langchain-core>=1.6,<2",
     "langchain-openai>=1.7,<2",
     "langchain-text-splitters>=1.1,<2",
+    "numpy>=2,<3",  # InMemoryVectorStore similarity
     "strands-agents[openai]>=1.61,<2",
     "neo4j>=6.4,<7",
     "openai>=2.50,<3",
@@ -21,7 +22,8 @@ dependencies = [
 
 [project.optional-dependencies]
 postgres = ["langgraph-checkpoint-postgres>=3,<4", "psycopg[binary,pool]>=3.2,<4"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.6"]
+aws = ["boto3>=1.35,<2"]
 
 [project.scripts]
 graphrag = "graphrag_stack.cli:main"
@@ -36,3 +38,13 @@ packages = ["src/graphrag_stack"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Cypher statements read better unwrapped.
+"src/graphrag_stack/storage/graph_store.py" = ["E501"]

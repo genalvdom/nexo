@@ -1,0 +1,60 @@
+"""LangGraph state and the structured messages that enter/leave it.
+
+State values are plain JSON (dicts/strings) so any checkpointer can persist
+them across the human-review pause, which can last hours.
+"""
+
+from __future__ import annotations
+
+import operator
+from datetime import date
+from typing import Annotated, Any, Literal, TypedDict
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from graphrag_stack.agents.models import RetrievalStrategy
+
+RoutingTarget = Literal["investigator", "rejected"]
+ApprovalStatus = Literal["pending", "approved", "rejected", "not_required"]
+
+
+class GraphState(TypedDict, total=False):
+    # --- required by the workflow contract ---
+    user_query: str
+    agent_outputs: Annotated[list[dict[str, Any]], operator.add]  # append-only audit trail
+    routing_target: RoutingTarget
+    approval_status: ApprovalStatus
+    # --- supporting fields ---
+    request_id: str
+    caller_clearance: str  # set by the authenticated service layer, never by an LLM
+    routing_reason: str
+    investigation_scope: dict[str, Any]
+    compliance_report: dict[str, Any]
+    review: dict[str, Any]
+    final_response: str | None
+
+
+class RouteDecision(BaseModel):
+    """Router LLM output (guided JSON)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: RoutingTarget
+    reason: str = Field(max_length=300)
+    strategy: RetrievalStrategy = "hybrid"
+    doc_types: list[str] | None = Field(default=None, description="Only if the request restricts document types")
+    effective_from: date | None = None
+    effective_to: date | None = None
+
+
+class ReviewDecision(BaseModel):
+    """What a human reviewer sends to resume the paused compliance node."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_status: Literal["approved", "rejected"]
+    reviewer: str = Field(min_length=1, max_length=200)
+    comment: str | None = Field(default=None, max_length=2000)
+    acknowledged_findings: bool = Field(
+        default=False, description="Required to approve when the compliance report has blocking findings"
+    )

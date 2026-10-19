@@ -56,6 +56,19 @@ class Settings(BaseSettings):
     extraction_attempts: int = Field(default=3, ge=1)
     extraction_concurrency: int = Field(default=8, ge=1)
     require_grounded_evidence: bool = True
+    # Optional closed predicate ontology (JSON list); triples outside it are dropped.
+    allowed_relations: list[str] | None = None
+    # JSON object of acronym -> expansion, appended to embedded chunk text.
+    glossary_path: Path | None = None
+
+    # --- Sensitive data (PII/PHI) ---------------------------------------------
+    # comprehend_medical sends chunk text to Amazon Comprehend Medical
+    # DetectPHI; enable only where that data flow is approved.
+    sensitive_data_provider: Literal["none", "regex", "comprehend_medical"] = "regex"
+    sensitive_data_policy: Literal["tag", "redact"] = "tag"
+    aws_region: str | None = None
+    # Highest sensitivity a caller may see when the request does not say.
+    default_clearance: Literal["public", "internal", "pii", "phi"] = "internal"
 
     # --- Investigator agent budget -------------------------------------------
     agent_max_turns: int = Field(default=12, ge=1)
@@ -63,6 +76,7 @@ class Settings(BaseSettings):
     agent_max_tool_calls: int = Field(default=16, ge=1)
     agent_timeout_s: float = 300.0
     agent_max_chunks_per_call: int = Field(default=10, ge=1)
+    seed_chunks: int = Field(default=5, ge=0, description="vector hits handed to the agent for vector/hybrid intents")
     tool_result_max_chars: int = 12_000
 
     # --- Orchestration ---------------------------------------------------------
@@ -70,6 +84,11 @@ class Settings(BaseSettings):
     checkpoint_backend: Literal["sqlite", "postgres", "memory"] = "sqlite"
     checkpoint_sqlite_path: Path = Path(".data/checkpoints.sqlite")
     checkpoint_postgres_uri: SecretStr | None = None
+
+    # --- Evaluation (LLM-as-a-judge) ------------------------------------------
+    # Prefer a different model from the generator to reduce self-preference bias.
+    judge_base_url: str | None = None
+    judge_model: str | None = None
 
     # --- Observability ---------------------------------------------------------
     otel_service_name: str = "graphrag-stack"

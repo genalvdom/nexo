@@ -1,0 +1,77 @@
+"""Deterministic pre-review checks shown to the human reviewer.
+
+Pure functions of the agent output: the compliance node re-executes on
+resume, so these must be idempotent and side-effect free.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+from graphrag_stack.agents.models import AgentOutput
+from graphrag_stack.storage.schemas import Sensitivity
+from graphrag_stack.storage.sensitive_data import SensitiveDataDetector
+
+Severity = Literal["block", "warn"]
+
+
+class Finding(BaseModel):
+    code: str
+    severity: Severity
+    detail: str
+
+
+class ComplianceReport(BaseModel):
+    findings: list[Finding] = Field(default_factory=list)
+
+    @property
+    def blocking(self) -> bool:
+        return any(f.severity == "block" for f in self.findings)
+
+    def as_state(self) -> dict:
+        return {"findings": [f.model_dump() for f in self.findings], "blocking": self.blocking}
+
+
+def run_compliance_checks(output: AgentOutput | None, detector: SensitiveDataDetector) -> ComplianceReport:
+    report = ComplianceReport()
+    add = report.findings.append
+    if output is None or output.error:
+        add(Finding(code="investigation_failed", severity="block",
+                    detail=output.error if output else "no investigator output"))
+        return report
+    if not output.answer:
+        add(Finding(code="empty_answer", severity="block", detail="investigator returned no text"))
+        return report
+
+    if not output.citations:
+        add(Finding(code="no_citations", severity="block", detail="answer cites no source chunks"))
+    ungrounded = [c for c in output.citations if c not in output.fetched_sensitivity]
+    if ungrounded:
+        # Cited ids whose text the agent never received: fabricated or guessed.
+        add(Finding(code="ungrounded_citations", severity="block", detail=", ".join(ungrounded)))
+
+    cited_levels = {Sensitivity(output.fetched_sensitivity[c]) for c in output.citations
+                    if c in output.fetched_sensitivity}
+    if Sensitivity.PHI in cited_levels:
+        add(Finding(code="phi_in_evidence", severity="block",
+                    detail="answer relies on PHI-classified chunks; confirm minimum-necessary disclosure"))
+    elif Sensitivity.PII in cited_levels:
+        add(Finding(code="pii_in_evidence", severity="warn", detail="answer relies on PII-classified chunks"))
+
+    detected = sorted({d.category for d in detector.detect(output.answer)})
+    if detected:
+        add(Finding(code="sensitive_data_in_answer", severity="block", detail=", ".join(detected)))
+
+    if output.stop_reason.startswith("limit_"):
+        add(Finding(code="budget_exhausted", severity="warn",
+                    detail=f"agent stopped on {output.stop_reason}; answer may be incomplete"))
+    failed_tools = [c for c in output.tool_calls if not c.ok]
+    if failed_tools:
+        add(Finding(code="tool_errors", severity="warn",
+                    detail=f"{len(failed_tools)} of {len(output.tool_calls)} tool calls failed"))
+    if output.withheld_chunk_ids:
+        add(Finding(code="evidence_withheld", severity="warn",
+                    detail=f"{len(output.withheld_chunk_ids)} chunk(s) above clearance or outside scope"))
+    return report

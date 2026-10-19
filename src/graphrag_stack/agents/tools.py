@@ -1,0 +1,217 @@
+"""The investigator's two tools, bound to one investigation's context.
+
+Tools are built per investigation (closures over `InvestigationContext`) so
+budget, clearance and the evidence ledger are per request and thread safe.
+Expected failures (bad Cypher, unknown ids, budget exhausted) are returned to
+the model as JSON errors it can act on; only programming errors raise.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired
+from strands import tool
+
+from graphrag_stack.agents.models import InvestigationScope, ToolCallSummary
+from graphrag_stack.config import Settings
+from graphrag_stack.storage.graph_store import ReadResult, UnsafeCypherError, validate_read_only_cypher
+from graphrag_stack.storage.schemas import CHUNK_ID_RE, ChunkRecord
+from graphrag_stack.telemetry import traced_span
+
+
+class GraphReader(Protocol):
+    def run_read_query(self, cypher: str, parameters: dict[str, Any] | None = None) -> ReadResult: ...
+
+
+class ChunkReader(Protocol):
+    def get_by_ids(self, chunk_ids: Sequence[str]) -> list[ChunkRecord]: ...
+
+
+@dataclass
+class InvestigationContext:
+    """Evidence ledger and budget for one investigation."""
+
+    request_id: str
+    scope: InvestigationScope
+    max_tool_calls: int
+    calls: list[ToolCallSummary] = field(default_factory=list)
+    discovered_chunk_ids: set[str] = field(default_factory=set)
+    fetched: dict[str, str] = field(default_factory=dict)  # chunk_id -> sensitivity
+    withheld: set[str] = field(default_factory=set)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def reserve_call(self) -> bool:
+        # Strands may run tool calls from one model turn concurrently.
+        with self._lock:
+            if len(self.calls) >= self.max_tool_calls:
+                return False
+            self.calls.append(ToolCallSummary(tool="(reserved)", ok=False))
+            return True
+
+    def complete_call(self, summary: ToolCallSummary) -> None:
+        with self._lock:
+            for i, existing in enumerate(self.calls):
+                if existing.tool == "(reserved)":
+                    self.calls[i] = summary
+                    return
+            self.calls.append(summary)
+
+
+def _collect_chunk_ids(value: Any, found: set[str]) -> None:
+    if isinstance(value, str):
+        if CHUNK_ID_RE.fullmatch(value):
+            found.add(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_chunk_ids(item, found)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_chunk_ids(item, found)
+
+
+def _redact_above(value: Any, clearance_rank: int) -> Any:
+    """Redact node/relationship maps whose sensitivity exceeds the caller's clearance.
+
+    Only catches values projected as whole nodes; scalar projections
+    (RETURN e.name) need database-side RBAC on the :PII/:PHI labels.
+    """
+    if isinstance(value, dict):
+        if int(value.get("max_sensitivity_rank", 0) or 0) > clearance_rank:
+            return {"redacted": "above caller clearance"}
+        return {k: _redact_above(v, clearance_rank) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_above(v, clearance_rank) for v in value]
+    return value
+
+
+def _dump(payload: dict[str, Any], max_chars: int) -> str:
+    """Serialise, dropping trailing rows/chunks (never cutting JSON) to fit the budget."""
+    text = json.dumps(payload, default=str, ensure_ascii=False)
+    for key in ("rows", "chunks"):
+        items = payload.get(key)
+        while len(text) > max_chars and isinstance(items, list) and items:
+            items.pop()
+            payload["omitted_for_size"] = payload.get("omitted_for_size", 0) + 1
+            text = json.dumps(payload, default=str, ensure_ascii=False)
+    if len(text) > max_chars:
+        return json.dumps({"error": "result too large; return fewer or smaller properties"})
+    return text
+
+
+def build_investigation_tools(
+    *, graph: GraphReader, chunks: ChunkReader, ctx: InvestigationContext, settings: Settings
+) -> list[Any]:
+    clearance = ctx.scope.chunk_filter.max_sensitivity
+    max_chars = settings.tool_result_max_chars
+
+    @tool
+    def query_knowledge_graph(cypher_query: str) -> str:
+        """Run one read-only Cypher query against the Neo4j knowledge graph to trace multi-hop relationships.
+
+        Bound variable-length paths (for example -[*1..3]-) and always LIMIT results. Return the chunk_id or
+        chunk_ids properties of the nodes and relationships you care about so their source text can be fetched.
+        The result lists every chunk id it saw under "chunk_ids_found".
+
+        Args:
+            cypher_query: A single read-only Cypher statement (MATCH, OPTIONAL MATCH, WITH, WHERE, RETURN,
+                UNWIND, CALL subqueries). Writes and procedure calls are rejected.
+        """
+        if not ctx.reserve_call():
+            return json.dumps({"error": "tool budget exhausted; write your answer from the evidence gathered"})
+        started = time.perf_counter()
+        attributes = {"db.system.name": "neo4j", "db.operation.name": "READ", "request.id": ctx.request_id}
+        if settings.otel_capture_content:
+            attributes["db.query.text"] = cypher_query[:4000]
+        with traced_span("neo4j.read_query", attributes) as span:
+            try:
+                query = validate_read_only_cypher(cypher_query)
+                result = graph.run_read_query(query)
+            except UnsafeCypherError as exc:
+                return _finish(ctx, "query_knowledge_graph", started, False, str(exc),
+                               {"error": str(exc), "hint": "rewrite as a single read-only query"})
+            except (ServiceUnavailable, SessionExpired):
+                span.set_attribute("error.type", "graph_unavailable")
+                return _finish(ctx, "query_knowledge_graph", started, False, "graph unavailable",
+                               {"error": "knowledge graph unavailable; do not retry, report what you have"})
+            except Neo4jError as exc:  # syntax errors, timeouts, access-mode violations
+                return _finish(ctx, "query_knowledge_graph", started, False, exc.code or "neo4j error",
+                               {"error": exc.message or str(exc), "code": exc.code})
+            rows = _redact_above(result.rows, clearance.rank)
+            found: set[str] = set()
+            _collect_chunk_ids(rows, found)
+            with ctx._lock:
+                ctx.discovered_chunk_ids |= found
+            span.set_attributes({"db.response.returned_rows": len(rows), "db.response.truncated": result.truncated})
+            payload = {
+                "row_count": len(rows),
+                "truncated": result.truncated,
+                "rows": rows,
+                "chunk_ids_found": sorted(found),
+            }
+            return _finish(ctx, "query_knowledge_graph", started, True, f"{len(rows)} rows", payload, max_chars)
+
+    @tool
+    def fetch_vector_chunks(chunk_ids: list[str]) -> str:
+        """Fetch the exact source text for chunk ids found in the knowledge graph.
+
+        This is the evidence: cite facts as [chunk:<chunk_id>] using only chunks returned here or given to you
+        as seed passages. Chunks outside the caller's clearance or scope are withheld.
+
+        Args:
+            chunk_ids: Chunk ids (format chk_ followed by 16 hex characters) from graph results.
+        """
+        if not ctx.reserve_call():
+            return json.dumps({"error": "tool budget exhausted; write your answer from the evidence gathered"})
+        started = time.perf_counter()
+        requested = list(dict.fromkeys(chunk_ids))
+        well_formed = [c for c in requested if CHUNK_ID_RE.fullmatch(c)]
+        valid = well_formed[: settings.agent_max_chunks_per_call]
+        with traced_span("vector_store.get_by_ids", {"db.operation.name": "GET", "chunks.requested": len(valid),
+                                                     "request.id": ctx.request_id}) as span:
+            try:
+                records = chunks.get_by_ids(valid)
+            except Exception as exc:  # store down or corrupt: tell the agent, keep the trace
+                span.record_exception(exc)
+                return _finish(ctx, "fetch_vector_chunks", started, False, type(exc).__name__,
+                               {"error": "vector store unavailable; report what you have"})
+            returned, withheld = [], []
+            sensitivity = {r.chunk_id: r.sensitivity.value for r in records}
+            for record in records:
+                if not ctx.scope.chunk_filter.allows(record):
+                    withheld.append(record.chunk_id)
+                    continue
+                returned.append({
+                    "chunk_id": record.chunk_id,
+                    "source": " > ".join([p for p in [record.title or record.source_id, *record.section_path] if p]),
+                    "effective_date": record.effective_date,
+                    "text": record.text,
+                })
+            payload = {
+                "chunks": returned,
+                "withheld": withheld,
+                "not_found": sorted(set(valid) - set(sensitivity)),
+                "invalid_ids": [c for c in requested if c not in well_formed],
+                "over_limit_not_fetched": well_formed[len(valid):],
+            }
+            text = _finish(ctx, "fetch_vector_chunks", started, True, f"{len(returned)} chunks", payload, max_chars)
+            # Only text the model actually received counts as evidence.
+            with ctx._lock:
+                ctx.fetched.update({c["chunk_id"]: sensitivity[c["chunk_id"]] for c in payload["chunks"]})
+                ctx.withheld.update(withheld)
+            span.set_attributes({"chunks.returned": len(payload["chunks"]), "chunks.withheld": len(withheld)})
+            return text
+
+    return [query_knowledge_graph, fetch_vector_chunks]
+
+
+def _finish(ctx: InvestigationContext, name: str, started: float, ok: bool, detail: str,
+            payload: dict[str, Any], max_chars: int = 4000) -> str:
+    ctx.complete_call(ToolCallSummary(tool=name, ok=ok, detail=detail[:200],
+                                      duration_ms=round((time.perf_counter() - started) * 1000, 1)))
+    return _dump(payload, max_chars)
