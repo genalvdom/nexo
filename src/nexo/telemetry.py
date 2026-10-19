@@ -32,9 +32,9 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SimpleSpanProcessor
 from opentelemetry.trace import Span, Status, StatusCode
 
-from graphrag_stack.config import Settings
+from nexo.config import Settings
 
-TRACER_NAME = "graphrag_stack"
+TRACER_NAME = "nexo"
 
 _setup_lock = threading.Lock()
 _provider: TracerProvider | None = None

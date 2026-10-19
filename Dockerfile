@@ -5,4 +5,4 @@ COPY pyproject.toml ./
 COPY src ./src
 RUN pip install --no-cache-dir ".[postgres]" && mkdir -p /app/.data && chown app /app/.data
 USER app
-ENTRYPOINT ["graphrag"]
+ENTRYPOINT ["nexo"]

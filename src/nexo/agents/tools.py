@@ -18,11 +18,11 @@ from typing import Any, Protocol
 from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired
 from strands import tool
 
-from graphrag_stack.agents.models import InvestigationScope, ToolCallSummary
-from graphrag_stack.config import Settings
-from graphrag_stack.storage.graph_store import ReadResult, UnsafeCypherError, validate_read_only_cypher
-from graphrag_stack.storage.schemas import CHUNK_ID_RE, ChunkRecord
-from graphrag_stack.telemetry import traced_span
+from nexo.agents.models import InvestigationScope, ToolCallSummary
+from nexo.config import Settings
+from nexo.storage.graph_store import ReadResult, UnsafeCypherError, validate_read_only_cypher
+from nexo.storage.schemas import CHUNK_ID_RE, ChunkRecord
+from nexo.telemetry import traced_span
 
 
 class GraphReader(Protocol):

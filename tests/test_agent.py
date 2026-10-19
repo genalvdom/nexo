@@ -10,11 +10,11 @@ from neo4j.exceptions import Neo4jError, ServiceUnavailable
 from openai.types.chat import ChatCompletion
 from strands.models.openai import OpenAIModel
 
-from graphrag_stack.agents.investigator import Investigator, extract_citations
-from graphrag_stack.agents.models import InvestigationScope
-from graphrag_stack.agents.tools import InvestigationContext, build_investigation_tools
-from graphrag_stack.storage.schemas import Sensitivity
-from graphrag_stack.storage.vector_store import ChunkFilter
+from nexo.agents.investigator import Investigator, extract_citations
+from nexo.agents.models import InvestigationScope
+from nexo.agents.tools import InvestigationContext, build_investigation_tools
+from nexo.storage.schemas import Sensitivity
+from nexo.storage.vector_store import ChunkFilter
 from tests.conftest import FakeGraph, make_chunk
 
 

@@ -24,7 +24,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import BaseModel, ValidationError
 
-from graphrag_stack.config import Settings
+from nexo.config import Settings
 
 if TYPE_CHECKING:
     from strands.models.openai import OpenAIModel

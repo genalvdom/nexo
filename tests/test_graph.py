@@ -11,11 +11,11 @@ from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from graphrag_stack.agents.models import AgentOutput, InvestigationScope
-from graphrag_stack.orchestration.graph import GraphDependencies, build_graph
-from graphrag_stack.service import Runtime, open_checkpointer
-from graphrag_stack.storage.sensitive_data import RegexDetector
-from graphrag_stack.telemetry import OTelCallbackHandler
+from nexo.agents.models import AgentOutput, InvestigationScope
+from nexo.orchestration.graph import GraphDependencies, build_graph
+from nexo.service import Runtime, open_checkpointer
+from nexo.storage.sensitive_data import RegexDetector
+from nexo.telemetry import OTelCallbackHandler
 
 CHUNK = "chk_" + "a" * 16
 
@@ -164,9 +164,9 @@ def test_trace_covers_request_nodes_and_handoff(settings, spans):
     rt = runtime(settings, FakeInvestigator([grounded_output()]))
     rt.start("q", thread_id="t12")
     finished = {s.name: s for s in spans.get_finished_spans()}
-    assert {"graphrag.request", "langgraph.node router", "langgraph.node investigator",
+    assert {"nexo.request", "langgraph.node router", "langgraph.node investigator",
             "langgraph.node compliance", "investigator.strands_agent"} <= set(finished)
-    request = finished["graphrag.request"]
+    request = finished["nexo.request"]
     handoff = finished["investigator.strands_agent"]
     assert handoff.context.trace_id == request.context.trace_id  # one trace across the task boundary
     assert any(e.name == "graph.interrupt" for e in request.events)

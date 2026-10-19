@@ -8,8 +8,8 @@ import sys
 from datetime import date
 from pathlib import Path
 
-from graphrag_stack.config import get_settings
-from graphrag_stack.telemetry import shutdown_telemetry
+from nexo.config import get_settings
+from nexo.telemetry import shutdown_telemetry
 
 
 def _print(model) -> None:
@@ -17,8 +17,8 @@ def _print(model) -> None:
 
 
 def _ingest(args: argparse.Namespace) -> int:
-    from graphrag_stack.service import open_ingestor
-    from graphrag_stack.storage.schemas import DocumentMetadata, Sensitivity
+    from nexo.service import open_ingestor
+    from nexo.storage.schemas import DocumentMetadata, Sensitivity
 
     metadata = DocumentMetadata(
         source_id=args.source_id or Path(args.file).stem,
@@ -35,7 +35,7 @@ def _ingest(args: argparse.Namespace) -> int:
 
 
 def _ask(args: argparse.Namespace) -> int:
-    from graphrag_stack.service import open_runtime
+    from nexo.service import open_runtime
 
     with open_runtime(get_settings()) as runtime:
         _print(runtime.start(args.query, thread_id=args.thread_id, clearance=args.clearance))
@@ -43,7 +43,7 @@ def _ask(args: argparse.Namespace) -> int:
 
 
 def _review(args: argparse.Namespace) -> int:
-    from graphrag_stack.service import open_runtime
+    from nexo.service import open_runtime
 
     decision = {
         "approval_status": "approved" if args.approve else "rejected",
@@ -57,7 +57,7 @@ def _review(args: argparse.Namespace) -> int:
 
 
 def _status(args: argparse.Namespace) -> int:
-    from graphrag_stack.service import open_runtime
+    from nexo.service import open_runtime
 
     with open_runtime(get_settings()) as runtime:
         _print(runtime.status(args.thread_id))
@@ -68,12 +68,12 @@ def _eval(args: argparse.Namespace) -> int:
     """Each JSONL line: {"question", "relevant_chunk_ids": [...], "reference_answer"?}."""
     from langchain_openai import ChatOpenAI
 
-    from graphrag_stack.agents.investigator import Investigator
-    from graphrag_stack.evaluation import judge_faithfulness, judge_relevancy, record_metrics, retrieval_scores
-    from graphrag_stack.llm import build_embeddings, build_strands_model
-    from graphrag_stack.storage.graph_store import GraphStore
-    from graphrag_stack.storage.vector_store import LocalChunkStore
-    from graphrag_stack.telemetry import setup_telemetry, traced_span
+    from nexo.agents.investigator import Investigator
+    from nexo.evaluation import judge_faithfulness, judge_relevancy, record_metrics, retrieval_scores
+    from nexo.llm import build_embeddings, build_strands_model
+    from nexo.storage.graph_store import GraphStore
+    from nexo.storage.vector_store import LocalChunkStore
+    from nexo.telemetry import setup_telemetry, traced_span
 
     settings = get_settings()
     setup_telemetry(settings)
@@ -105,7 +105,7 @@ def _eval(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="graphrag")
+    parser = argparse.ArgumentParser(prog="nexo")
     sub = parser.add_subparsers(dest="command", required=True)
 
     ingest = sub.add_parser("ingest", help="chunk, embed and extract a text/Markdown document")

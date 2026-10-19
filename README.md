@@ -1,4 +1,4 @@
-# graphrag-stack
+# Nexo
 
 Graph RAG investigation service: LangGraph orchestration, a Strands Agents micro-agent, a self-hosted vLLM
 model (Llama 3.3 70B), Neo4j and a vector chunk store, traced end to end with OpenTelemetry.
@@ -28,9 +28,9 @@ cp .env.example .env                                   # fill in secrets
 docker compose up -d neo4j otel-collector jaeger
 docker compose --profile gpu up -d                     # vLLM: needs 4x80GB GPUs
 pip install -e ".[dev]"
-graphrag ingest docs/memo.md --doc-type memo --effective-date 2025-06-30
-graphrag ask "How is Acme Holdings connected to Gamma Clinics?"   # prints thread_id + review packet
-graphrag review <thread_id> --approve --reviewer you@corp
+nexo ingest docs/memo.md --doc-type memo --effective-date 2025-06-30
+nexo ask "How is Acme Holdings connected to Gamma Clinics?"   # prints thread_id + review packet
+nexo review <thread_id> --approve --reviewer you@corp
 ```
 
 Traces: http://localhost:16686 (Jaeger). Neo4j Enterprise least-privilege reader: `deploy/neo4j-rbac.cypher`.
@@ -39,8 +39,8 @@ Traces: http://localhost:16686 (Jaeger). Neo4j Enterprise least-privilege reader
 
 ```bash
 pytest                                                  # offline: fakes for vLLM, real Strands + LangGraph
-podman run -d -p 127.0.0.1:7688:7687 -e NEO4J_AUTH=neo4j/graphrag-test-pass neo4j:5.26-community
-NEO4J_TEST_URI=bolt://127.0.0.1:7688 NEO4J_TEST_PASSWORD=graphrag-test-pass pytest tests/test_neo4j_integration.py
+podman run -d -p 127.0.0.1:7688:7687 -e NEO4J_AUTH=neo4j/nexo-test-pass neo4j:5.26-community
+NEO4J_TEST_URI=bolt://127.0.0.1:7688 NEO4J_TEST_PASSWORD=nexo-test-pass pytest tests/test_neo4j_integration.py
 ```
 
 ## Production notes

@@ -26,7 +26,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import InMemoryVectorStore
 from pydantic import BaseModel, ConfigDict
 
-from graphrag_stack.storage.schemas import ChunkRecord, Sensitivity
+from nexo.storage.schemas import ChunkRecord, Sensitivity
 
 
 class ChunkFilter(BaseModel):

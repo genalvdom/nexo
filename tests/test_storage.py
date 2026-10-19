@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from graphrag_stack.storage.chunking import flatten_markdown_tables, glossary_notes, lint_document, split_document
-from graphrag_stack.storage.graph_store import UnsafeCypherError, _plan_writes, validate_read_only_cypher
-from graphrag_stack.storage.schemas import (
+from nexo.storage.chunking import flatten_markdown_tables, glossary_notes, lint_document, split_document
+from nexo.storage.graph_store import UnsafeCypherError, _plan_writes, validate_read_only_cypher
+from nexo.storage.schemas import (
     DocumentMetadata,
     EntityRef,
     EntityType,
@@ -16,8 +16,8 @@ from graphrag_stack.storage.schemas import (
     entity_key,
     normalize_relation,
 )
-from graphrag_stack.storage.sensitive_data import RegexDetector, classify, redact
-from graphrag_stack.storage.vector_store import ChunkFilter
+from nexo.storage.sensitive_data import RegexDetector, classify, redact
+from nexo.storage.vector_store import ChunkFilter
 from tests.conftest import make_chunk
 
 
@@ -134,8 +134,8 @@ def test_chunk_filter_enforces_clearance_and_scope():
 
 
 def test_vector_store_roundtrip_filter_and_stale_delete(settings, chunk_store):
-    from graphrag_stack.llm import build_embeddings
-    from graphrag_stack.storage.vector_store import LocalChunkStore
+    from nexo.llm import build_embeddings
+    from nexo.storage.vector_store import LocalChunkStore
 
     a = make_chunk("doc", 0, "alpha")
     b = make_chunk("doc", 1, "beta", Sensitivity.PHI)

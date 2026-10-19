@@ -1,7 +1,7 @@
 """Runs the real Cypher against Neo4j. Skipped unless NEO4J_TEST_URI is set, e.g.
 
-    podman run -d -p 127.0.0.1:7688:7687 -e NEO4J_AUTH=neo4j/graphrag-test-pass neo4j:5.26-community
-    NEO4J_TEST_URI=bolt://127.0.0.1:7688 NEO4J_TEST_PASSWORD=graphrag-test-pass pytest tests/test_neo4j_integration.py
+    podman run -d -p 127.0.0.1:7688:7687 -e NEO4J_AUTH=neo4j/nexo-test-pass neo4j:5.26-community
+    NEO4J_TEST_URI=bolt://127.0.0.1:7688 NEO4J_TEST_PASSWORD=nexo-test-pass pytest tests/test_neo4j_integration.py
 """
 
 from __future__ import annotations
@@ -13,11 +13,11 @@ import pytest
 from neo4j import GraphDatabase
 from neo4j.exceptions import ClientError
 
-from graphrag_stack.agents.models import InvestigationScope
-from graphrag_stack.agents.tools import InvestigationContext, build_investigation_tools
-from graphrag_stack.storage.graph_store import GraphStore
-from graphrag_stack.storage.schemas import EntityRef, GroundedTriple, Sensitivity, Triple
-from graphrag_stack.storage.vector_store import ChunkFilter
+from nexo.agents.models import InvestigationScope
+from nexo.agents.tools import InvestigationContext, build_investigation_tools
+from nexo.storage.graph_store import GraphStore
+from nexo.storage.schemas import EntityRef, GroundedTriple, Sensitivity, Triple
+from nexo.storage.vector_store import ChunkFilter
 
 URI = os.environ.get("NEO4J_TEST_URI")
 pytestmark = pytest.mark.skipif(not URI, reason="NEO4J_TEST_URI not set")
@@ -99,12 +99,12 @@ def test_end_to_end_ingest_investigate_approve(store, settings, chunk_store):
     from langgraph.checkpoint.memory import InMemorySaver
     from strands.models.openai import OpenAIModel
 
-    from graphrag_stack.agents.investigator import Investigator
-    from graphrag_stack.orchestration.graph import GraphDependencies, build_graph
-    from graphrag_stack.service import Runtime
-    from graphrag_stack.storage.ingest import KnowledgeGraphIngestor
-    from graphrag_stack.storage.schemas import DocumentMetadata
-    from graphrag_stack.storage.sensitive_data import RegexDetector
+    from nexo.agents.investigator import Investigator
+    from nexo.orchestration.graph import GraphDependencies, build_graph
+    from nexo.service import Runtime
+    from nexo.storage.ingest import KnowledgeGraphIngestor
+    from nexo.storage.schemas import DocumentMetadata
+    from nexo.storage.sensitive_data import RegexDetector
     from tests.test_agent import ScriptedClient, _completion, _tool_call
 
     doc = "# Deals\n\nAcme Holdings acquired Beta Labs in 2024. Beta Labs supplies Gamma Clinics."

@@ -31,19 +31,19 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from graphrag_stack.config import Settings
-from graphrag_stack.llm import StructuredOutputError, invoke_structured
-from graphrag_stack.storage.chunking import flatten_markdown_tables, glossary_notes, lint_document, split_document
-from graphrag_stack.storage.schemas import (
+from nexo.config import Settings
+from nexo.llm import StructuredOutputError, invoke_structured
+from nexo.storage.chunking import flatten_markdown_tables, glossary_notes, lint_document, split_document
+from nexo.storage.schemas import (
     ChunkRecord,
     DocumentMetadata,
     EntityType,
     ExtractionResult,
     GroundedTriple,
 )
-from graphrag_stack.storage.sensitive_data import SensitiveDataDetector, classify, redact
-from graphrag_stack.storage.vector_store import ChunkStore
-from graphrag_stack.telemetry import traced_span
+from nexo.storage.sensitive_data import SensitiveDataDetector, classify, redact
+from nexo.storage.vector_store import ChunkStore
+from nexo.telemetry import traced_span
 
 logger = logging.getLogger(__name__)
 

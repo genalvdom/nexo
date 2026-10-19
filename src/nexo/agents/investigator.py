@@ -20,12 +20,12 @@ from strands import Agent
 from strands.models import Model
 from strands.types.agent import Limits
 
-from graphrag_stack.agents.models import AgentOutput, InvestigationScope
-from graphrag_stack.agents.tools import GraphReader, InvestigationContext, build_investigation_tools
-from graphrag_stack.config import Settings
-from graphrag_stack.storage.graph_store import DATA_MODEL
-from graphrag_stack.storage.schemas import CHUNK_ID_RE, ChunkRecord
-from graphrag_stack.storage.vector_store import ChunkFilter, ChunkStore
+from nexo.agents.models import AgentOutput, InvestigationScope
+from nexo.agents.tools import GraphReader, InvestigationContext, build_investigation_tools
+from nexo.config import Settings
+from nexo.storage.graph_store import DATA_MODEL
+from nexo.storage.schemas import CHUNK_ID_RE, ChunkRecord
+from nexo.storage.vector_store import ChunkFilter, ChunkStore
 
 SYSTEM_PROMPT = """\
 You are a relationship-tracing investigator for a corporate knowledge graph. Your goal is to \

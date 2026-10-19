@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     judge_model: str | None = None
 
     # --- Observability ---------------------------------------------------------
-    otel_service_name: str = "graphrag-stack"
+    otel_service_name: str = "nexo"
     # OTLP/HTTP base URL, e.g. http://otel-collector:4318. Unset = no export.
     otel_exporter_otlp_endpoint: str | None = None
     otel_console_export: bool = False

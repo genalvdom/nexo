@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from graphrag_stack.storage.vector_store import ChunkFilter
+from nexo.storage.vector_store import ChunkFilter
 
 RetrievalStrategy = Literal["graph", "vector", "hybrid"]
 

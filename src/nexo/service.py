@@ -19,16 +19,16 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from pydantic import BaseModel
 
-from graphrag_stack.agents.investigator import Investigator
-from graphrag_stack.config import Settings
-from graphrag_stack.llm import build_chat_model, build_embeddings, build_strands_model
-from graphrag_stack.orchestration.graph import GraphDependencies, build_graph
-from graphrag_stack.orchestration.state import ReviewDecision
-from graphrag_stack.storage.graph_store import GraphStore
-from graphrag_stack.storage.ingest import KnowledgeGraphIngestor
-from graphrag_stack.storage.sensitive_data import build_detector
-from graphrag_stack.storage.vector_store import LocalChunkStore
-from graphrag_stack.telemetry import OTelCallbackHandler, setup_telemetry, traced_span
+from nexo.agents.investigator import Investigator
+from nexo.config import Settings
+from nexo.llm import build_chat_model, build_embeddings, build_strands_model
+from nexo.orchestration.graph import GraphDependencies, build_graph
+from nexo.orchestration.state import ReviewDecision
+from nexo.storage.graph_store import GraphStore
+from nexo.storage.ingest import KnowledgeGraphIngestor
+from nexo.storage.sensitive_data import build_detector
+from nexo.storage.vector_store import LocalChunkStore
+from nexo.telemetry import OTelCallbackHandler, setup_telemetry, traced_span
 
 
 class RunResult(BaseModel):
@@ -55,7 +55,7 @@ def open_checkpointer(settings: Settings) -> Iterator[BaseCheckpointSaver]:
         with SqliteSaver.from_conn_string(str(settings.checkpoint_sqlite_path)) as saver:
             yield saver
     else:
-        from langgraph.checkpoint.postgres import PostgresSaver  # extra: graphrag-stack[postgres]
+        from langgraph.checkpoint.postgres import PostgresSaver  # extra: nexo[postgres]
 
         if settings.checkpoint_postgres_uri is None:
             raise ValueError("CHECKPOINT_POSTGRES_URI is required for the postgres backend")
@@ -88,11 +88,11 @@ class Runtime:
 
     def _config(self, thread_id: str) -> dict[str, Any]:
         return {"configurable": {"thread_id": thread_id}, "callbacks": self.callbacks,
-                "run_name": "graphrag-investigation", "metadata": {"thread_id": thread_id}}
+                "run_name": "nexo-investigation", "metadata": {"thread_id": thread_id}}
 
     def _drive(self, payload: Any, thread_id: str, operation: str) -> RunResult:
-        attributes = {"graphrag.operation": operation, "langgraph.thread_id": thread_id}
-        with traced_span("graphrag.request", attributes) as span:
+        attributes = {"nexo.operation": operation, "langgraph.thread_id": thread_id}
+        with traced_span("nexo.request", attributes) as span:
             for update in self.graph.stream(payload, self._config(thread_id), stream_mode="updates"):
                 for node, delta in update.items():
                     if node == "__interrupt__":
@@ -100,8 +100,8 @@ class Runtime:
                     else:  # every state transition is visible on the request span
                         span.add_event("graph.state_update", {"node": node, "keys": sorted(delta or {})})
             result = self._result(thread_id, self._pending(thread_id))
-            span.set_attributes({"graphrag.status": result.status,
-                                 "graphrag.approval_status": result.approval_status or ""})
+            span.set_attributes({"nexo.status": result.status,
+                                 "nexo.approval_status": result.approval_status or ""})
             return result
 
     def _pending(self, thread_id: str) -> dict[str, Any] | None:

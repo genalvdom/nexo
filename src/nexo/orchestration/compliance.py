@@ -10,9 +10,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from graphrag_stack.agents.models import AgentOutput
-from graphrag_stack.storage.schemas import Sensitivity
-from graphrag_stack.storage.sensitive_data import SensitiveDataDetector
+from nexo.agents.models import AgentOutput
+from nexo.storage.schemas import Sensitivity
+from nexo.storage.sensitive_data import SensitiveDataDetector
 
 Severity = Literal["block", "warn"]
 

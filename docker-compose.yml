@@ -2,7 +2,7 @@
 # config.py, so the same .env works here and in Kubernetes.
 #   docker compose up -d neo4j otel-collector jaeger         # CPU-only pieces
 #   docker compose --profile gpu up -d                        # + vLLM (4x80GB GPUs for 70B)
-#   docker compose run --rm graphrag ingest /docs/memo.md --doc-type memo
+#   docker compose run --rm nexo ingest /docs/memo.md --doc-type memo
 
 services:
   vllm-inference-service:
@@ -66,18 +66,18 @@ services:
     image: jaegertracing/all-in-one:1.62.0
     ports: ["127.0.0.1:16686:16686"]
 
-  graphrag:
+  nexo:
     build: .
     profiles: ["app"]
     env_file: [{ path: .env, required: false }]
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       NEO4J_URI: neo4j://neo4j:7687
-    volumes: ["graphrag-data:/app/.data", "./docs:/docs:ro"]
+    volumes: ["nexo-data:/app/.data", "./docs:/docs:ro"]
     depends_on:
       neo4j: { condition: service_healthy }
 
 volumes:
   hf-cache:
   neo4j-data:
-  graphrag-data:
+  nexo-data:

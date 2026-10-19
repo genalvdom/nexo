@@ -5,10 +5,10 @@ import json
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 
-from graphrag_stack.storage.ingest import KnowledgeGraphIngestor
-from graphrag_stack.storage.schemas import DocumentMetadata, Sensitivity
-from graphrag_stack.storage.sensitive_data import RegexDetector
-from graphrag_stack.storage.vector_store import ChunkFilter
+from nexo.storage.ingest import KnowledgeGraphIngestor
+from nexo.storage.schemas import DocumentMetadata, Sensitivity
+from nexo.storage.sensitive_data import RegexDetector
+from nexo.storage.vector_store import ChunkFilter
 
 DOC = "# Deals\n\nAcme Holdings acquired Beta Labs in 2024. Contact: cfo@acme.example."
 

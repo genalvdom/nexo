@@ -20,9 +20,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from opentelemetry import trace
 from pydantic import BaseModel, Field
 
-from graphrag_stack.agents.models import AgentOutput
-from graphrag_stack.llm import invoke_structured
-from graphrag_stack.storage.schemas import Triple
+from nexo.agents.models import AgentOutput
+from nexo.llm import invoke_structured
+from nexo.storage.schemas import Triple
 
 
 def _ratio(numerator: int, denominator: int) -> float | None:

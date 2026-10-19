@@ -26,16 +26,16 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import RetryPolicy, interrupt
 from pydantic import ValidationError
 
-from graphrag_stack.agents.investigator import is_transient
-from graphrag_stack.agents.models import AgentOutput, InvestigationScope
-from graphrag_stack.config import Settings
-from graphrag_stack.llm import invoke_structured
-from graphrag_stack.orchestration.compliance import run_compliance_checks
-from graphrag_stack.orchestration.state import GraphState, ReviewDecision, RouteDecision
-from graphrag_stack.storage.schemas import Sensitivity
-from graphrag_stack.storage.sensitive_data import SensitiveDataDetector
-from graphrag_stack.storage.vector_store import ChunkFilter
-from graphrag_stack.telemetry import traced_span
+from nexo.agents.investigator import is_transient
+from nexo.agents.models import AgentOutput, InvestigationScope
+from nexo.config import Settings
+from nexo.llm import invoke_structured
+from nexo.orchestration.compliance import run_compliance_checks
+from nexo.orchestration.state import GraphState, ReviewDecision, RouteDecision
+from nexo.storage.schemas import Sensitivity
+from nexo.storage.sensitive_data import SensitiveDataDetector
+from nexo.storage.vector_store import ChunkFilter
+from nexo.telemetry import traced_span
 
 ROUTER_PROMPT = """\
 You are the intake validator for an internal relationship-investigation service over a \
@@ -193,4 +193,4 @@ def build_graph(deps: GraphDependencies, checkpointer: BaseCheckpointSaver) -> C
                                   {"investigator": "investigator", "rejected": END})
     builder.add_edge("investigator", "compliance")
     builder.add_edge("compliance", END)
-    return builder.compile(checkpointer=checkpointer, name="graphrag-investigation")
+    return builder.compile(checkpointer=checkpointer, name="nexo-investigation")

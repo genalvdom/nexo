@@ -25,8 +25,8 @@ from neo4j import READ_ACCESS, WRITE_ACCESS, Driver, GraphDatabase, ManagedTrans
 from neo4j.exceptions import ServiceUnavailable, SessionExpired
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
-from graphrag_stack.config import Settings
-from graphrag_stack.storage.schemas import RELATION_RE, EntityType, GroundedTriple
+from nexo.config import Settings
+from nexo.storage.schemas import RELATION_RE, EntityType, GroundedTriple
 
 DATA_MODEL = """\
 (:Entity:<EntityType>[:PII][:PHI] {key, name, type, description, chunk_id, chunk_ids, source_ids,

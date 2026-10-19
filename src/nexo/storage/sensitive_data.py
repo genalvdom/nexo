@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Protocol
 
-from graphrag_stack.storage.schemas import Sensitivity
+from nexo.storage.schemas import Sensitivity
 
 
 @dataclass(frozen=True)
@@ -59,7 +59,7 @@ class ComprehendMedicalDetector:
     _MAX_CHARS = 18_000  # stay under the byte limit for mostly-ASCII text
 
     def __init__(self, region_name: str, min_score: float = 0.5) -> None:
-        import boto3  # optional dependency: `pip install graphrag-stack[aws]`
+        import boto3  # optional dependency: `pip install nexo[aws]`
 
         self._client = boto3.client("comprehendmedical", region_name=region_name)
         self._min_score = min_score

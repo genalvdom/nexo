@@ -12,7 +12,7 @@ from typing import Annotated, Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from graphrag_stack.agents.models import RetrievalStrategy
+from nexo.agents.models import RetrievalStrategy
 
 RoutingTarget = Literal["investigator", "rejected"]
 ApprovalStatus = Literal["pending", "approved", "rejected", "not_required"]

@@ -1,5 +1,5 @@
 [project]
-name = "graphrag-stack"
+name = "nexo"
 version = "0.1.0"
 description = "Graph RAG investigation stack: LangGraph orchestration, Strands micro-agent, vLLM, Neo4j"
 requires-python = ">=3.11"
@@ -26,14 +26,14 @@ dev = ["pytest>=8", "ruff>=0.6"]
 aws = ["boto3>=1.35,<2"]
 
 [project.scripts]
-graphrag = "graphrag_stack.cli:main"
+nexo = "nexo.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/graphrag_stack"]
+packages = ["src/nexo"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -47,4 +47,4 @@ select = ["E", "F", "W", "B", "UP", "I"]
 
 [tool.ruff.lint.per-file-ignores]
 # Cypher statements read better unwrapped.
-"src/graphrag_stack/storage/graph_store.py" = ["E501"]
+"src/nexo/storage/graph_store.py" = ["E501"]

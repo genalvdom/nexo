@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
-from graphrag_stack.storage.schemas import ChunkRecord, DocumentMetadata
+from nexo.storage.schemas import ChunkRecord, DocumentMetadata
 
 _HEADERS = [("#", "h1"), ("##", "h2"), ("###", "h3"), ("####", "h4")]
 _TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")

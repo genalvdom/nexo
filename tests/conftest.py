@@ -9,11 +9,11 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from graphrag_stack.config import Settings
-from graphrag_stack.llm import build_embeddings
-from graphrag_stack.storage.graph_store import ReadResult
-from graphrag_stack.storage.schemas import ChunkRecord, Sensitivity
-from graphrag_stack.storage.vector_store import LocalChunkStore
+from nexo.config import Settings
+from nexo.llm import build_embeddings
+from nexo.storage.graph_store import ReadResult
+from nexo.storage.schemas import ChunkRecord, Sensitivity
+from nexo.storage.vector_store import LocalChunkStore
 
 _EXPORTER = InMemorySpanExporter()
 _provider = TracerProvider()
