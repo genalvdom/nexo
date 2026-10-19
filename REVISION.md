@@ -1,8 +1,8 @@
 # Revisión de diseño: preguntas abiertas
 
-Revisión hecha leyendo el código en el commit `5d61cf9` (19-oct-2026). No se ejecutó el stack completo; los
-comportamientos descritos salen del código y de los tests existentes. Las referencias son `archivo:línea` en ese
-commit.
+Revisión hecha leyendo el código en el commit `5d61cf9` (19-oct-2026) y verificada de nuevo contra `40e8e34`:
+todos los hallazgos siguen vigentes. No se ejecutó el stack completo; los comportamientos descritos salen del código
+y de los tests existentes. Las referencias son `archivo:línea` en `40e8e34`.
 
 Este archivo está en la raíz y no en `docs/` porque `tests/test_docs_okf.py` exige que todo `.md` de `docs/` siga el
 formato OKF y esté en un índice.
@@ -26,8 +26,8 @@ Lo que todavía no tiene:
 | --- | --- |
 | API o servicio | Solo CLI. |
 | Formatos de entrada | `ingest` hace `read_text()` (`cli.py:36`); no lee PDF ni Word. |
-| Autenticación | `--clearance` lo elige quien pregunta (`cli.py:168`), aunque `state.py` indica que lo fija una capa de servicio autenticada. `--reviewer` es texto libre (`cli.py:176`). |
-| Escala | `LocalChunkStore` (`vector_store.py:70`) es un JSON en un solo nodo (documentado en el README). |
+| Autenticación | `--clearance` lo elige quien pregunta (`cli.py:165`), aunque `state.py` indica que lo fija una capa de servicio autenticada. `--reviewer` es texto libre (`cli.py:173`). |
+| Escala | `LocalChunkStore` (`vector_store.py:110`) es un JSON en un solo nodo (documentado en el README). |
 | Borrado | No hay comando para eliminar un documento (sección 2). |
 
 ## 2. ¿Qué pasa cuando un documento se actualiza o se elimina?
@@ -56,8 +56,9 @@ Lo que todavía no tiene:
 4. **La sensibilidad solo sube.** `max_sensitivity_rank` y las etiquetas `:PII`/`:PHI` nunca bajan
    (`graph_store.py:305`), aunque se retire el documento que las causó. Falla hacia el lado seguro, pero no se
    corrige.
-5. **La identidad del documento es el nombre del archivo** (`cli.py:28`). Renombrar el archivo crea un documento
-   nuevo y deja el viejo; dos archivos con el mismo nombre en carpetas distintas se pisan.
+5. **Por defecto, la identidad del documento es el nombre del archivo** (`cli.py:28`). `--source-id` permite
+   fijarla, pero es opcional: sin él, renombrar el archivo crea un documento nuevo y deja el viejo, y dos archivos
+   con el mismo nombre en carpetas distintas se pisan.
 6. **Revisiones en pausa con citas obsoletas.** Si un documento cambia mientras una investigación espera revisión,
    sus citas pueden apuntar a chunks borrados. Al reanudar, compliance (`graph.py:176`) no verifica que existan.
 7. **Escala.** `_delete_source` recorre todas las relaciones (`graph_store.py:359`); ningún índice cubre los
@@ -65,7 +66,7 @@ Lo que todavía no tiene:
 
 **Propuestas:** un comando `nexo delete <source_id>`; guardar evidencia y certeza por chunk (ver sección 3); no
 borrar la procedencia de los chunks que fallaron en la extracción; recalcular la sensibilidad al retirar fuentes;
-dar a `source_id` un valor estable y obligatorio; revalidar las citas al reanudar una revisión.
+hacer `--source-id` obligatorio (o derivarlo de una ruta estable); revalidar las citas al reanudar una revisión.
 
 ## 3. ¿Cómo evitar que una relación mal extraída se propague?
 
@@ -73,10 +74,10 @@ dar a `source_id` un valor estable y obligatorio; revalidar las citas al reanuda
 
 - Esquema validado con Pydantic y temperatura 0.
 - Cita literal obligatoria (`ingest.py:191`).
-- Ontología opcional (`ontology.py`, `ONTOLOGY_PATH` sin valor por defecto en `config.py:63`) con sinónimos,
+- Ontología opcional (`ontology.py`, `ONTOLOGY_PATH` sin valor por defecto en `config.py:100`) con sinónimos,
   inversos y tipos de origen y destino. `Ontology.map` (`ontology.py:73`) invierte la dirección cuando los tipos solo
   encajan al revés (`ontology.py:81`); lo que no encaja queda como `RELATED_TO {predicate}`.
-- Resolución de entidades (`resolution.py`, por defecto `llm` en `config.py:65`): exacta, por alias y con un árbitro
+- Resolución de entidades (`resolution.py`, por defecto `llm` en `config.py:102`): exacta, por alias y con un árbitro
   LLM; cada decisión queda en `MENTIONED_IN {surface, resolution}`.
 - Al responder: el agente debe leer y citar el texto, compliance bloquea citas no leídas y hay revisión humana.
 
