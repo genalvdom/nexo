@@ -24,7 +24,6 @@ from langgraph.func import task
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import RetryPolicy, interrupt
-from opentelemetry import propagate
 from pydantic import ValidationError
 
 from graphrag_stack.agents.investigator import is_transient
@@ -122,10 +121,10 @@ def build_graph(deps: GraphDependencies, checkpointer: BaseCheckpointSaver) -> C
     # the (expensive, non-deterministic) agent. Transient vLLM/Neo4j failures
     # retry the whole investigation; its tools are read-only, so that is safe.
     @task(name="strands_investigation", retry_policy=RetryPolicy(max_attempts=2, retry_on=is_transient))
-    def strands_investigation(user_query: str, request_id: str, scope: dict[str, Any],
-                              trace_carrier: dict[str, str]) -> dict[str, Any]:
-        parent = propagate.extract(trace_carrier)
-        with traced_span("investigator.strands_agent", {"request.id": request_id}, context=parent):
+    def strands_investigation(user_query: str, request_id: str, scope: dict[str, Any]) -> dict[str, Any]:
+        # LangGraph runs tasks with the caller's contextvars, so this span is a
+        # child of the request span and parents every Strands span below it.
+        with traced_span("investigator.strands_agent", {"request.id": request_id}):
             # ===== HANDOFF: LangGraph yields control to the Strands agent here =====
             output = deps.investigator.investigate(
                 user_query, request_id=request_id, scope=InvestigationScope.model_validate(scope)
@@ -134,11 +133,9 @@ def build_graph(deps: GraphDependencies, checkpointer: BaseCheckpointSaver) -> C
         return output.model_dump(mode="json")
 
     def investigator(state: GraphState) -> dict[str, Any]:
-        carrier: dict[str, str] = {}
-        propagate.inject(carrier)  # task threads may not inherit contextvars; pass W3C traceparent
         try:
             output = strands_investigation(
-                state["user_query"], state["request_id"], state.get("investigation_scope") or {}, carrier
+                state["user_query"], state["request_id"], state.get("investigation_scope") or {}
             ).result()
         except GraphBubbleUp:
             raise

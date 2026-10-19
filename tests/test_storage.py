@@ -23,7 +23,12 @@ from tests.conftest import make_chunk
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("works for", "WORKS_FOR"), ("worksFor", "WORKS_FOR"), ("WORKS-FOR", "WORKS_FOR"), ("3rd party of", "R_3RD_PARTY_OF")],
+    [
+        ("works for", "WORKS_FOR"),
+        ("worksFor", "WORKS_FOR"),
+        ("WORKS-FOR", "WORKS_FOR"),
+        ("3rd party of", "R_3RD_PARTY_OF"),
+    ],
 )
 def test_normalize_relation(raw, expected):
     assert normalize_relation(raw) == expected

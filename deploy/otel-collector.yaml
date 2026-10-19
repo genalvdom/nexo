@@ -1,0 +1,31 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+  # Belt and braces with OTEL_CAPTURE_CONTENT=false: never ship prompt/answer
+  # bodies even if a library records them.
+  attributes/strip-content:
+    actions:
+      - { key: gen_ai.prompt, action: delete }
+      - { key: gen_ai.completion, action: delete }
+      - { key: gen_ai.tool.input, action: delete }
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls: { insecure: true }
+  # LangSmith accepts OTLP too; uncomment to send the same traces there.
+  # otlphttp/langsmith:
+  #   endpoint: https://api.smith.langchain.com/otel
+  #   headers: { x-api-key: ${env:LANGSMITH_API_KEY} }
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [attributes/strip-content, batch]
+      exporters: [otlp/jaeger]
